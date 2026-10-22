@@ -162,8 +162,13 @@ Decide in Phase 2.1 and use one technique consistently.
 
 - `credentials: 'include'`; never set `Cookie` or `User-Agent` (forbidden or ignored).
 - `redirect: 'manual'` yields an opaque response (status 0) in browsers; adapt the attempt-budget path.
-- Session expiry: fetch follows the SAML/login redirect and gets **200 + HTML**. Detect by
-  content type or `response.redirected` and raise a typed "re-authentication required" error.
+- Session expiry: observed on 7.57 as **400 `text/html`** ("Session timed out"), no redirect. Other setups may
+  follow a SAML/login redirect and get 200 + HTML. Detect by HTML content type on `/sap/bc/adt` (or
+  `response.redirected`); retry once, refresh CSRF, then raise a typed "re-authentication required" error.
+- `sap-contextid` has path `/sap/bc/adt` (HttpOnly on 7.57, not on 7.31): a host page outside that path cannot
+  read it either way, so the close request goes without the `sap-contextid` header (verified to work on both; on
+  pre-7.50 + `abapfs_extensions` a stateless request to a 404 close path still ends the context). All tabs share it, and any explicit `stateless` ADT request ends
+  the context and its locks, so reads must send no session header.
 - `X-sap-adt-sessiontype`, `X-CSRF-Token`, `Accept`/`Content-Type` custom headers are fine same-origin.
 
 ---
@@ -186,14 +191,14 @@ Decide in Phase 2.1 and use one technique consistently.
 
 In a page served from the ABAP origin (or a dev proxy, see §7), with hand-written fetch:
 
-- [ ] GET discovery (`/sap/bc/adt/discovery`) and a program source with the browser session
-- [ ] CSRF fetch, then stateful lock, PUT source (`$TMP` object), unlock, activate
-- [ ] Record the `sap-contextid` cookie **path** and whether closing the ADT stateful session affects the web app's own session/context
-- [ ] Two tabs: concurrent lock attempts; tab closed while holding a lock (time until release)
-- [ ] Session timeout: confirm what fetch returns (redirect, 200 HTML, 401)
-- [ ] Repeat on oldest and newest target releases (e.g. 7.50 and 8.16) and note differences
-- [ ] Record results in `docs/research/<date>-browser-adt-session-spike.md` (release, auth route, observations, gaps)
-- **Go/no-go:** if the ADT stateful session cannot be isolated from the host app's session, stop and redesign before Phase 2.
+- [x] GET discovery (`/sap/bc/adt/discovery`) and a program source with the browser session (7.31, 7.57)
+- [x] CSRF fetch, then stateful lock, PUT source (`$TMP` object), unlock, activate (7.57; 7.31 with `abapfs_extensions`)
+- [x] Record the `sap-contextid` cookie **path** and whether closing the ADT stateful session affects the web app's own session/context (`/sap/bc/adt`, HttpOnly; host app unaffected)
+- [x] Two tabs: concurrent lock attempts; tab closed while holding a lock (time until release) — conflict; ~30 min orphan; one tab's close releases another tab's lock; `pagehide` keepalive close releases immediately
+- [x] Session timeout: confirm what fetch returns (redirect, 200 HTML, 401) — 400 `text/html` on 7.57
+- [x] Repeat on oldest and newest target releases (e.g. 7.50 and 8.16) and note differences — 7.31 (+ `abapfs_extensions`) and 7.57; 8.16 optional
+- [x] Record results in `docs/research/<date>-browser-adt-session-spike.md` (release, auth route, observations, gaps) — `2026-10-21-browser-adt-session-spike.md`
+- **Go/no-go:** if the ADT stateful session cannot be isolated from the host app's session, stop and redesign before Phase 2. **Result: GO (7.57).**
 
 ### Phase 2: Node-neutral seams (behavior-preserving, each its own upstream PR)
 
@@ -228,7 +233,9 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 ### Phase 5: Writes
 
 - [ ] `approveWrite` hook in the browser dispatch wrapper, using `ACTION_POLICY` scope to decide what counts as mutating; deny → tool error, nothing sent to SAP
-- [ ] Write queue across tabs (`navigator.locks`, one lock name per origin + SAP client)
+- [ ] Write queue across tabs (`navigator.locks`, one lock name per origin + SAP client), covering lock → modify → unlock → close-session (spike 6b: one tab's close releases another tab's locks)
+- [ ] Browser transport never sends `X-sap-adt-sessiontype: stateless` outside the close request, and drops the `sap-contextid` header (HttpOnly; close works without it)
+- [ ] While a stateful window is open, register a `pagehide` handler that sends a `keepalive` stateless close-session (spike 8b: releases an orphaned lock immediately instead of after ~30 min)
 - [ ] `auditRequiredForWrites`: refuse mutations when no sink can record; reads unaffected
 - [ ] Package allowlist, deny actions and transport gates via config, same enforcement as Node
 - [ ] Live CRUD on `$TMP` in the browser harness: create, update, `edit_method`, activate, delete; plus lock conflict and tab-close cases
@@ -248,13 +255,21 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 ## 6. Risks and open questions
 
 1. **Stateful session isolation** (Phase 1 go/no-go): ADT session vs host app session on one origin.
-2. **Authorizations:** users need `S_ADT_RES`, `S_DEVELOP`, a developer key (on-prem), `/sap/bc/adt` active in SICF.
-3. **Lock left behind** when a tab closes mid-write: held until the SAP session times out. Document it; keep lock windows short.
+2. **Authorizations / prerequisites:** users need `S_ADT_RES`, `S_DEVELOP`, a developer key (on-prem), `/sap/bc/adt`
+   active in SICF. Writes need SAP_BASIS ≥ 7.51 or the `abapfs_extensions` back-port (same as Node ARC-1, #293);
+   confirmed on 7.31 in `docs/research/2026-10-21-browser-adt-session-spike.md`.
+3. **Lock left behind** when a tab closes mid-write: held until the SAP session times out (~30 min observed on
+   7.57; blocks the user's own Eclipse too). Mitigation verified on 7.57: a `pagehide` handler sending a `keepalive`
+   stateless close-session releases it immediately. Register it while a stateful window is open; a browser crash
+   still leaves the lock until timeout.
 4. **Background-tab throttling** during ATC polling / long activation.
 5. **Bundle size** (abaplint is several MB): lazy-load; lint-before-write could default off in browser.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
 8. **Open:** audit gate shape (sink health vs separate gate); whether stored-text (SAPscript) is in v1; BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
+9. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
+   from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
+   and never send `stateless` on reads.
 
 ---
 
