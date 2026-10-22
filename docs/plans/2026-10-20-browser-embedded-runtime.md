@@ -132,15 +132,22 @@ Open: whether `LogSink` gets a `ready()/healthy` signal for `auditRequiredForWri
 **Decided 2026-10-22 (Phase 2.1): bundle-time stand-ins for drop-in Node built-ins, real seams only where
 behavior differs.**
 
-- Shared code keeps its `node:` imports. The browser build redirects drop-in built-ins (`node:crypto`; next
+- Shared code keeps its `node:` imports. The browser build redirects drop-in built-ins (`node:crypto`,
   `node:timers/promises`, `node:async_hooks`) to stand-ins under `src/browser/node-shims/`. The redirect map
   and both plugins (esbuild for the bundle, vite for tests) live in one place: `scripts/browser/node-shims.mjs`.
 - A stand-in implements exactly the call shapes shared code uses and **throws on anything else**, so a gap
   fails loudly instead of returning a different result.
-- Drift guard: `npm run test:browser-shims` (`vitest.browser-shims.config.ts`) re-runs the unit tests of every
-  shared module that imports a shimmed built-in, with the stand-ins swapped in. A guard test
-  (`tests/unit/browser/node-shims-redirect.shimtest.ts`) fails if the redirect silently stops applying.
-  Parity with real Node and an esbuild bundle proof run in the normal suite (`tests/unit/browser/node-shims-crypto.test.ts`).
+- Drift guard: `npm run test:browser-shims` (`vitest.browser-shims.config.ts`) re-runs the **whole unit suite**
+  with the stand-ins swapped in (~2 min locally, about the same as `npm test`). Exclusions are by scope only and
+  listed with reasons: Node-only files (OAuth, multi-target, Node HTTP server, signals, CLI subprocess) and three
+  tests that run tool calls concurrently on purpose. A guard test (`tests/unit/browser/node-shims-redirect.shimtest.ts`)
+  fails if any redirect silently stops applying. Parity with real Node and an esbuild bundle proof run in the
+  normal suite (`tests/unit/browser/node-shims-{crypto,runtime}.test.ts`).
+- The `node:async_hooks` stand-in keeps one active store per `AsyncLocalStorage` and restores the previous one
+  when a run settles. That equals Node only for strictly nested runs, which holds because the browser runtime
+  serializes tool calls. Overlapping runs throw (both calls fail) instead of sharing a request id, cancellation
+  signal or data budget. Known difference: work a run starts without awaiting reads whatever store is active
+  later, not the one that started it.
 - Real seams (config injection, as in Node) stay for HTTP/cookies (2.5), AFF schema loading (2.6) and
   lint/deny-action config (2.7).
 - `src/browser/` is excluded from the Node `tsc` emit (bundled by esbuild only; typechecked through
@@ -227,9 +234,11 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   `crypto.getRandomValues`); covers every in-scope user (`oauth.ts` is out of scope and uses `base64url`, which
   the stand-in refuses)
   - [ ] Wire `npm run test:browser-shims` into CI (`.github/workflows/test.yml`) in the upstream PR, or the drift guard never runs
-- [ ] 2.3 Timers: `node:timers/promises` stand-in
-- [ ] 2.4 Request context: `node:async_hooks` stand-in with a single-slot `AsyncLocalStorage` (valid because
-  browser tool calls are serialized); check that no shared code depends on concurrent context isolation
+- [x] 2.3 Timers: `node:timers/promises` stand-in (`setTimeout(delay, value, { signal })`, Node-shaped `AbortError`)
+- [x] 2.4 Request context: `node:async_hooks` stand-in (single-slot `AsyncLocalStorage`, overlap detection; see
+  §4.2). Checked at `7b210cbf`: in browser scope only `dispatch.ts` and `stored-text/source.ts` call `run()`, and
+  the stored-text run is nested and awaited; only three unit tests depend on concurrent tool calls.
+  - [ ] Phase 3: `createBrowserServer` must serialize `tools/call` (queue), or the overlap detection fails both calls
 - [ ] 2.5 HTTP: `fetchImpl` + `cookieMode` in `AdtHttpClient` config; bounded response on web streams; manual-redirect handling
   - Security-session gate (1.7.0, #1043, `security-session-gate.ts`): with no cookie jar, `hasSecuritySessionCookie`
     is always false, so only the first request runs alone until one succeeds. Unit-test that the gate opens with
