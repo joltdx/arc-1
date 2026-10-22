@@ -99,31 +99,44 @@ ai client (browser, same origin as ABAP)
 
 ## 4. Design
 
-### 4.1 Public contract (sketch, `@experimental`, like `arc-1/public`)
+### 4.1 Public contract (`@experimental`, like `arc-1/public`)
+
+As built in Phase 3 (`src/browser/index.ts`, `config.ts`, `message-port-transport.ts`); Phase 5 adds the write options.
 
 ```ts
-// src/browser/index.ts → package.json exports "./browser"
+export const BROWSER_API_VERSION = 1;
 export interface BrowserServerOptions {
-  /** ADT origin-relative fetch; default: globalThis.fetch with credentials:'include'. */
-  fetch?: typeof fetch;
-  /** Fully resolved settings; host decides where they come from. Defaults = safe read-only. */
-  config?: Partial<BrowserServerConfig>;
-  /** Audit/log sinks (existing LogSink interface, src/server/sinks/types.ts). */
-  sinks?: LogSink[];
-  /** If true and no sink can record, mutations are refused (reads continue). */
-  auditRequiredForWrites?: boolean;
-  /** Called before a mutating tools/call is dispatched (outside any lock). */
-  approveWrite?: (call: { tool: string; args: unknown; scope: Scope }) => Promise<boolean>;
-  /** Optional SAP client override (sap-client query param). */
-  sapClient?: string;
+  fetch?: typeof fetch;          // same-origin fetch on the user's session; default globalThis.fetch
+  baseUrl?: string;              // default globalThis.location.origin (the worker's origin)
+  config?: Partial<BrowserServerConfig>; // host settings; unknown or unsupported keys throw
+  user?: string;                 // host-supplied SAP user (decided 2026-10-22), see below
+  sinks?: LogSink[];             // audit sinks in addition to the console
+  // Phase 5: auditRequiredForWrites?: boolean; approveWrite?: (call) => Promise<boolean>;
 }
 export function createBrowserServer(options?: BrowserServerOptions): {
-  server: Server;                 // @modelcontextprotocol/sdk Server
-  connect(transport: Transport): Promise<void>;
+  server: Server; config: Readonly<ServerConfig>;
+  connect(transport: Transport): Promise<void>; // then probes features, then tools/list_changed
   close(): Promise<void>;
 };
-export { MessagePortTransport } from './message-port-transport.js'; // worker ⇄ main thread
+export { MessagePortTransport, type MessagePortLike }; // Worker, MessagePort or the worker's own scope
 ```
+
+- **Config** (`resolveBrowserConfig`): an allowlist of `ServerConfig` keys (safety flags and lists, feature
+  toggles, tool mode, limits, `client`, `language`, labels). Anything else throws, so a URL, credentials,
+  plugins, a lint config file, SQLite cache, abapGit or git writes are never silently ignored. `allowedPackages: []`
+  is refused (it means "all packages" to the safety check; `['*']` says so explicitly). Defaults are Node's plus
+  `client: ''` (no `sap-client` parameter: the browser session is already bound to one client, and a different
+  value would mean another logon), `cacheMode: 'memory'` and `featureAbapGit: 'off'`. `SAPQuery.long_text` is always
+  added to the deny actions, so stored text is hidden from `tools/list` and refused at dispatch.
+- **User**: the browser cannot read the logged-on user from its session (no SAP user configured, no bearer token),
+  so the host passes it. It becomes `AdtClient.username` / `ServerConfig.username` (used for `adtcore:responsible` on
+  create, `SAPRead SYSTEM`, transport and trace defaults) and the audit `user`. It is never sent as a credential: the
+  browser `AdtHttpClient` is built separately, so the `browserFetch` credential guard is unaffected.
+- **Scopes**: calls carry a fixed `authInfo` with `scopes: ['admin']`, so as on stdio the safety ceiling is the only
+  ARC-1 gate; `clientId: 'arc-1-browser'` and the user land in every audit event.
+- **Serialization**: tool calls and the feature probe share one queue (the request-context stand-in requires it).
+  The probe runs first after `connect`; `tools/list` never waits for it. `tools/list_changed` is sent only after the
+  client's `initialized` notification (otherwise a fast probe notifies before `initialize` is answered).
 
 Open: whether `LogSink` gets a `ready()/healthy` signal for `auditRequiredForWrites`, or a separate `AuditGate` option.
 
@@ -235,12 +248,12 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 - [x] 2.2 `node:crypto` stand-in (`createHash('sha256')` via `@noble/hashes`, `randomBytes` via
   `crypto.getRandomValues`); covers every in-scope user (`oauth.ts` is out of scope and uses `base64url`, which
   the stand-in refuses)
-  - [ ] Wire `npm run test:browser-shims` into CI (`.github/workflows/test.yml`) in the upstream PR, or the drift guard never runs
+  - [x] Wire `npm run test:browser-shims` into CI (`.github/workflows/test.yml`, after the unit tests)
 - [x] 2.3 Timers: `node:timers/promises` stand-in (`setTimeout(delay, value, { signal })`, Node-shaped `AbortError`)
 - [x] 2.4 Request context: `node:async_hooks` stand-in (single-slot `AsyncLocalStorage`, overlap detection; see
   §4.2). Checked at `7b210cbf`: in browser scope only `dispatch.ts` and `stored-text/source.ts` call `run()`, and
   the stored-text run is nested and awaited; only three unit tests depend on concurrent tool calls.
-  - [ ] Phase 3: `createBrowserServer` must serialize `tools/call` (queue), or the overlap detection fails both calls
+  - [x] Phase 3: `createBrowserServer` serializes `tools/call` and the feature probe (one queue)
 - [x] 2.5 HTTP: one option, `AdtHttpConfig.browserFetch` (not `fetchImpl` + `cookieMode`: in a browser they always go
   together). Refuses proxy/TLS/credential/WAF-gzip options; `credentials: 'include'`; no `Cookie`/`User-Agent`;
   one attempt-budget charge per fetch; opaque manual redirects treated like 3xx (`bounded-response.ts`). Tests:
@@ -268,16 +281,37 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 
 ### Phase 3: Browser entry + bundle
 
-- [ ] `src/browser/index.ts` (`createBrowserServer`), `config.ts` (browser defaults and validation; reuse `DEFAULT_CONFIG` / `validateConfig` where possible), `message-port-transport.ts`
-- [ ] `package.json` `exports["./browser"]`; mark `@experimental` like `arc-1/public`
-- [ ] Bundle script `build:browser` (esbuild, ESM, worker-targeted, `browserBuildOptions()`); lazy-load abaplint
-- [ ] `getEffectiveUser()` returns `''` in the browser (no SAP user configured, no bearer token): decide how the
-  runtime learns the user for `adtcore:responsible` on create and `SAPRead SYSTEM` (host-supplied, or a SAP call)
-- [ ] Browser config refuses or hides what v1 does not support: stored text (`SAPQuery long_text`), abapGit,
-  WAF gzip, cookie/credential auth
-- [ ] CI guard `scripts/ci/check-browser-bundle.mjs`: fail on forbidden imports; enforce a size budget (fails on its own staleness, Playbook §5)
-- [ ] Unit tests: `createBrowserServer` + `InMemoryTransport` → `initialize`, `tools/list`, `tools/call` against `mock-fetch`
-- [ ] Snapshot test: browser `tools/list` for read-only and full configs (new fixtures under `tests/fixtures/tool-definitions/browser-*.json`)
+- [x] `src/browser/index.ts` (`createBrowserServer`, `createBrowserClient`, `browserToolDefinitions`), `config.ts`
+  (`resolveBrowserConfig`: browser defaults on `DEFAULT_CONFIG`, reuses `validateConfig`, `validateDenyActions`,
+  `normalizeSystemLabel`, `canonicalDataSourceNames`), `message-port-transport.ts`. See §4.1. No upstream file changed
+- Packaging: moved to Phase 6 (decided 2026-10-22: a separate package, see there). Not needed for Phases 4–5, which
+  use the local `build:browser` output
+- [x] Bundle script `build:browser` (`scripts/browser/build.mjs`, `browserBundleOptions()`): minified ESM with code
+  splitting (`index.js` + `chunks/`, for a module Worker), `keepNames`, source map opt-in (`--sourcemap`, 14 MB).
+  Two esbuild findings, both caught only by running the minified bundle:
+  - Without `splitting`, esbuild evaluates dynamic `import()` targets lazily (`__esm`), the zod modules they reach
+    become lazy too, and the MCP SDK (which imports zod through `export *` re-exports) gets no init call:
+    "Class2 is not a constructor" at load. Splitting removes the lazy wrappers
+  - abaplint registers syntax handlers by class name; minified names collide ("duplicate statement syntax handler")
+  - Lazy-loading abaplint: **deferred.** It is half the bundle (2.0 of 4.2 MB minified, ~1 MB gzipped total) but is
+    statically imported by 12 modules, including read paths (`features.ts`, method/unit surgery, compressor, deps).
+    Lazy-loading means making those async upstream. The bundle loads in a worker, off the main thread; revisit with
+    Phase 4 load-time measurements
+- [x] `getEffectiveUser()`: host-supplied `user` option (decided 2026-10-22), see §4.1
+- [x] Browser config refuses or hides what v1 does not support: stored text (always-denied action), abapGit
+  (`featureAbapGit` fixed off, `allowGitWrites` not configurable), SQLite cache, plugins, lint config files,
+  URL/credential/cookie/TLS/WAF-gzip settings (unknown key → error; `browserFetch` refuses them too)
+- [x] CI guard `scripts/ci/check-browser-bundle.mjs` (`npm run check:browser-bundle`, wired into `test.yml`):
+  forbidden packages, leftover imports, size budget over entry + chunks (4,350,000 bytes; fails below 90%, Playbook §5)
+- [x] Unit tests: `tests/unit/browser/browser-server.test.ts` (`createBrowserServer` + `InMemoryTransport`:
+  config validation, tool surface, read, write refusal, stored-text denial, serialization, probe, audit user,
+  `SAPRead SYSTEM`); `message-port-transport.test.ts`; `browser-bundle.test.ts` runs the shipped minified bundle in a
+  worker thread over a `MessageChannel` and fails if the bundle reads any Node global (getter traps, because Node's
+  own `Response` reads `Buffer`)
+- [x] Snapshot test: `tests/unit/browser/browser-tool-definitions.test.ts` →
+  `tests/fixtures/tool-definitions/browser-{readonly,full}.json`
+- Note: with `allowWrites: false`, `SAPWrite update` still reads the object's metadata (the package allowlist check
+  resolves the real package before the write gate). Same as Node; it sends no mutating request
 
 ### Phase 4: Read-only end-to-end
 
@@ -303,6 +337,14 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 - [ ] ADR-0010 draft: trust model (§1.3), host-as-admin argument, safe defaults, out-of-scope list
 - [ ] Docs page `docs_page/browser-runtime.md` (embedding guide; host responsibilities)
 - [ ] Roadmap: narrow or replace FEAT-59 in overview and details
+- [ ] Packaging (preferred 2026-10-22): a second, `@experimental` package from the same repo and release run
+  (e.g. `@arc-mcp/arc-1-browser`), same version as `arc-1`, published by the same release job. It has no
+  dependencies (the bundle contains everything), so browser consumers do not install Node ARC-1's ~68 MB of
+  dependencies (express, undici, native `better-sqlite3`), and Node users do not carry the bundle. Fallback: ship it
+  in `arc-1` as `exports["./browser"]` (+1.0 MB tarball / +4.2 MB unpacked, +68%; ~6% of the full install with
+  dependencies). Ruled out: consumers building from source (the npm package ships no `src/` or build setup, and the
+  esbuild setup is easy to get subtly wrong). Either way: declarations for the public API only (`tsc` does not emit
+  `src/browser/`). Until then the product consumes a fork build (e.g. a GitHub release asset)
 - [ ] Seam PRs first (small, `refactor:`), then the `feat:` browser entry PR
 - [ ] If upstream declines: keep `feat/browser-runtime` as a thin fork (seams + entry only) and publish internally
 
@@ -319,7 +361,8 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
    stateless close-session releases it immediately. Register it while a stateful window is open; a browser crash
    still leaves the lock until timeout.
 4. **Background-tab throttling** during ATC polling / long activation.
-5. **Bundle size** (abaplint is several MB): lazy-load; lint-before-write could default off in browser.
+5. **Bundle size**: 4.2 MB minified, ~1 MB gzipped (2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. Lazy-loading
+   abaplint needs upstream async changes in 12 modules (Phase 3 note); decide with Phase 4 load times.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
 8. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).

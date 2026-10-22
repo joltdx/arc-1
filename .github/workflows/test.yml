@@ -112,6 +112,10 @@ jobs:
       - name: Check size and schema budgets
         run: npm run check:sizes
 
+      # Browser runtime: bundles without Node-only packages and within its size budget.
+      - name: Check browser bundle
+        run: npm run check:browser-bundle
+
       - name: npx package smoke test
         run: npm run test:npx-smoke
 
@@ -120,6 +124,10 @@ jobs:
 
       - name: Offline target authorization harness tests
         run: npm run test:target-auth:harness
+
+      # Re-runs the unit suite with the browser runtime's Node stand-ins swapped in (drift guard).
+      - name: Run unit tests with browser stand-ins
+        run: npm run test:browser-shims
 
       - name: Upload unit test results
         if: always()
