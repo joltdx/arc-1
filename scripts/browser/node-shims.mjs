@@ -14,7 +14,9 @@ const shimDir = join(root, 'src', 'browser', 'node-shims') + sep;
 
 /** Built-in specifier → stand-in source file. */
 export const NODE_SHIMS = {
+  'node:async_hooks': join(shimDir, 'async-hooks.ts'),
   'node:crypto': join(shimDir, 'crypto.ts'),
+  'node:timers/promises': join(shimDir, 'timers-promises.ts'),
 };
 
 /** True when `importer` is shared source whose Node built-ins the browser build replaces. */
