@@ -307,4 +307,19 @@ describe('createBrowserServer', () => {
     expect(result.isError).toBeFalsy();
     expect(text(result)).toContain('DEVELOPER');
   });
+
+  it('asks for a new logon in the browser when the SAP session has ended', async () => {
+    const loggedOff: Route = (url) =>
+      url.pathname === PROGRAM_PATH
+        ? mockResponse(401, '<html>Logon Error Message</html>', { 'content-type': 'text/html' })
+        : undefined;
+    const { client } = await connect({ fetch: routedFetch(loggedOff) });
+
+    const result = await client.callTool({ name: 'SAPRead', arguments: { type: 'PROG', name: 'ZHELLO' } });
+
+    expect(result.isError).toBe(true);
+    expect(text(result)).toContain('no longer logged on to SAP in this browser');
+    expect(text(result)).toContain('log on to SAP again in this browser');
+    expect(text(result)).not.toMatch(/SAP_USER|SAP_PASSWORD|Logon Error Message/);
+  });
 });
