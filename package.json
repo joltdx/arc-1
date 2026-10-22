@@ -54,6 +54,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser-shims": "vitest run --config vitest.browser-shims.config.ts",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:integration:slow": "vitest run --config vitest.integration.slow.config.ts",
     "test:integration:btp": "vitest run --config vitest.integration.config.ts tests/integration/btp-abap.integration.test.ts",
@@ -141,6 +142,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.2",
+    "@noble/hashes": "^2.4.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",

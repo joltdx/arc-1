@@ -129,21 +129,32 @@ Open: whether `LogSink` gets a `ready()/healthy` signal for `auditRequiredForWri
 
 ### 4.2 Seam technique
 
-Prefer **package `imports` with conditions** so Node code paths stay as they are and bundlers
-pick the browser variant:
+**Decided 2026-10-22 (Phase 2.1): bundle-time stand-ins for drop-in Node built-ins, real seams only where
+behavior differs.**
 
-```json
-"imports": {
-  "#platform/*": { "browser": "./dist/platform/*.browser.js", "default": "./dist/platform/*.node.js" }
-}
-```
+- Shared code keeps its `node:` imports. The browser build redirects drop-in built-ins (`node:crypto`; next
+  `node:timers/promises`, `node:async_hooks`) to stand-ins under `src/browser/node-shims/`. The redirect map
+  and both plugins (esbuild for the bundle, vite for tests) live in one place: `scripts/browser/node-shims.mjs`.
+- A stand-in implements exactly the call shapes shared code uses and **throws on anything else**, so a gap
+  fails loudly instead of returning a different result.
+- Drift guard: `npm run test:browser-shims` (`vitest.browser-shims.config.ts`) re-runs the unit tests of every
+  shared module that imports a shimmed built-in, with the stand-ins swapped in. A guard test
+  (`tests/unit/browser/node-shims-redirect.shimtest.ts`) fails if the redirect silently stops applying.
+  Parity with real Node and an esbuild bundle proof run in the normal suite (`tests/unit/browser/node-shims-crypto.test.ts`).
+- Real seams (config injection, as in Node) stay for HTTP/cookies (2.5), AFF schema loading (2.6) and
+  lint/deny-action config (2.7).
+- `src/browser/` is excluded from the Node `tsc` emit (bundled by esbuild only; typechecked through
+  `tsconfig.tests.json`), so the npm package never ships a file importing the `@noble/hashes` devDependency.
 
-Fallback if this complicates `tsc`/vitest: runtime injection via a `platform` object set once at startup.
-Decide in Phase 2.1 and use one technique consistently.
+Why not the alternatives: package `imports` with conditions (`#platform/*`) and runtime injection of a
+`platform` object both touch every importing module upstream (more PRs and review load), and `imports` had
+unproven `tsc`/vitest/dist resolution. Upstream precedent (1.7.0, #1027) points the same way: the
+single-executable build bundles with esbuild (`scripts/build-sea.mjs`) and switches platform behavior inside
+the module (`isSea()` in `aff/validator.ts`, lazy `createRequire` in `cache/sqlite-driver.ts`).
 
-Upstream precedent (1.7.0, #1027): the single-executable build bundles with esbuild (`scripts/build-sea.mjs`,
-`esbuild` is already a devDependency) and switches platform behavior inside the module (`isSea()` in
-`aff/validator.ts`, lazy `createRequire` in `cache/sqlite-driver.ts`), not through package `imports`.
+Gotcha (vite 8 / vitest 5): vite externalizes `node:` built-ins before any plugin's `resolveId` runs, so the
+test plugin rewrites the import specifiers in shared source during `transform` instead. esbuild's
+`onResolve` works directly.
 
 ### 4.3 Node-only inventory (verified 2026-10-20 against upstream main `1ff575d9`; re-checked 2026-10-22 at `7b210cbf`, v1.7.0)
 
@@ -152,10 +163,10 @@ Upstream precedent (1.7.0, #1027): the single-executable build bundles with esbu
 | Outgoing HTTP | `src/adt/http.ts` (undici `Agent`/`Client`), `bounded-response.ts` (`node:stream`, undici), `request-attempt-budget.ts` (undici) | `fetchImpl` seam at `doFetch` (`http.ts` ~L1335, the single outbound choke point); no dispatcher/proxy; byte-bounding via WHATWG `ReadableStream` reader |
 | Cookie jar | `http.ts` `cookieJar`, `cookies.ts` (`node:fs`) | `cookieMode: 'browser'`: no jar, no `Cookie` header, no file reload; CSRF logic unchanged |
 | Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | Browser: no jar clone possible; serialize via write queue (`navigator.locks`); close-session behavior must be re-verified (§6 risk 1) |
-| Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | Context-provider seam; browser impl = single slot, valid because tool calls are serialized |
-| Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | `#platform/hash` (sync, pure-JS sha256, e.g. `@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
+| Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | `node:async_hooks` stand-in: single-slot `AsyncLocalStorage`, valid because tool calls are serialized |
+| Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | **Done (2.2):** `node:crypto` stand-in, sync pure-JS sha256 (`@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
 | Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | WAF gzip: unsupported in browser (config refuses); stored text: `DecompressionStream` or exclude in v1 |
-| Timers | `http-deadline.ts`, `ci-quality.ts` (`node:timers/promises`) | `setTimeout` promise |
+| Timers | `http-deadline.ts`, `ci-quality.ts` (`node:timers/promises`) | `node:timers/promises` stand-in (`setTimeout` promise) |
 | Files | `aff/validator.ts` (schema files; since 1.7.0 also `node:sea` assets via `readSchemaText`), `lint/config-builder.ts`, `server/deny-actions.ts` | AFF schemas bundled/lazy-imported (`readSchemaText` is the natural seam point); lint config + deny actions passed as objects |
 | Cache | `cache/sqlite.ts`, `cache/sqlite-driver.ts` (`better-sqlite3` or `node:sqlite` via `node:module`, since 1.7.0) | Memory cache only |
 | Server setup | `server/server.ts` `createServer` (express, XSUAA, multi-target, plugins, stdio, `node:http`) | **Do not reuse.** New small `src/browser/` entry composing `AdtClient` + `getToolDefinitions` + `handleToolCall` |
@@ -211,10 +222,14 @@ In a page served from the ABAP origin (or a dev proxy, see §7), with hand-writt
 
 For every seam: no tool-definition fixture diff, existing tests green, new unit tests for both implementations.
 
-- [ ] 2.1 Decide seam technique (§4.2) with a minimal proof on one module (hash)
-- [ ] 2.2 `#platform/hash` + random; replace all `node:crypto` uses in the inventory
-- [ ] 2.3 Timers
-- [ ] 2.4 Request-context provider (`context.ts`); keep `AsyncLocalStorage` as Node default
+- [x] 2.1 Decide seam technique (§4.2) with a minimal proof on one module (hash): bundle-time stand-ins
+- [x] 2.2 `node:crypto` stand-in (`createHash('sha256')` via `@noble/hashes`, `randomBytes` via
+  `crypto.getRandomValues`); covers every in-scope user (`oauth.ts` is out of scope and uses `base64url`, which
+  the stand-in refuses)
+  - [ ] Wire `npm run test:browser-shims` into CI (`.github/workflows/test.yml`) in the upstream PR, or the drift guard never runs
+- [ ] 2.3 Timers: `node:timers/promises` stand-in
+- [ ] 2.4 Request context: `node:async_hooks` stand-in with a single-slot `AsyncLocalStorage` (valid because
+  browser tool calls are serialized); check that no shared code depends on concurrent context isolation
 - [ ] 2.5 HTTP: `fetchImpl` + `cookieMode` in `AdtHttpClient` config; bounded response on web streams; manual-redirect handling
   - Security-session gate (1.7.0, #1043, `security-session-gate.ts`): with no cookie jar, `hasSecuritySessionCookie`
     is always false, so only the first request runs alone until one succeeds. Unit-test that the gate opens with
