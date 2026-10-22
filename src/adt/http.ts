@@ -16,7 +16,7 @@ import { connectivityProxyResponse, prepareBoundedResponse } from './bounded-res
 import { resolveCookies } from './cookies.js';
 import { resolveAcceptType, resolveContentType } from './discovery.js';
 import { AdtApiError, AdtNetworkError, AdtResponseLimitError } from './errors.js';
-import { assertBrowserCompatible, sendBrowserRequest } from './http-browser.js';
+import { assertBrowserCompatible, browserSessionEnded, sendBrowserRequest } from './http-browser.js';
 import {
   type AdtRequestOptions,
   awaitWithinRequestBudget,
@@ -706,13 +706,9 @@ export class AdtHttpClient {
       // Handle 401 session timeout — reset session and retry once.
       // Uses per-request guard (not instance-level) so concurrent requests each get their own retry.
       // On success, reassigns response/responseBody and falls through to downstream handlers
-      // (403 CSRF, 406/415 negotiation) so combined-failure recovery works.
-      if (
-        response.status === 401 &&
-        !authRetried &&
-        this.config.retryUnauthorized !== false &&
-        options?.noReplay !== true
-      ) {
+      // (403 CSRF, 406/415 negotiation) so combined-failure recovery works. Browser: see browserSessionEnded.
+      const sessionLost = response.status === 401 || !!browserSessionEnded(this.config, path, response);
+      if (sessionLost && !authRetried && this.config.retryUnauthorized !== false && options?.noReplay !== true) {
         authRetried = true;
 
         logger.emitAudit({
@@ -721,7 +717,7 @@ export class AdtHttpClient {
           event: 'http_request',
           method,
           path,
-          statusCode: 401,
+          statusCode: response.status,
           durationMs: Date.now() - httpStart,
           errorBody: '401 session expired — resetting session and retrying',
         });
@@ -994,21 +990,27 @@ export class AdtHttpClient {
         this.clearCookiesAndMark();
       }
       this.notifyUnauthorized(path);
-      throw new AdtApiError(
-        'ADT call returned HTML login page — authentication required. If using cookies, they may have expired. If using Basic auth, credentials may be invalid or not authorized for ADT (S_ADT_RES missing). If on an SSO-only system, try SAP_DISABLE_SAML=true or see docs/enterprise-auth.md. Re-run arc-1 after fixing.',
-        401,
-        path,
-        body.slice(0, 500),
+      throw (
+        browserSessionEnded(this.config, path, { status, headers }, true) ??
+        new AdtApiError(
+          'ADT call returned HTML login page — authentication required. If using cookies, they may have expired. If using Basic auth, credentials may be invalid or not authorized for ADT (S_ADT_RES missing). If on an SSO-only system, try SAP_DISABLE_SAML=true or see docs/enterprise-auth.md. Re-run arc-1 after fixing.',
+          401,
+          path,
+          body.slice(0, 500),
+        )
       );
     }
 
     if (expectBody) rejectEmptyAdtHtmlResponse(status, contentType, body, path);
 
-    if (status >= 400) {
+    if (status >= 400 || (status === 0 && this.config.browserFetch)) {
       if (status === 401) {
         this.notifyUnauthorized(path);
       }
-      throw new AdtApiError(body.slice(0, 500), status, path, body);
+      throw (
+        browserSessionEnded(this.config, path, { status, headers }) ??
+        new AdtApiError(body.slice(0, 500), status, path, body)
+      );
     }
 
     // Flatten headers to Record<string, string>
@@ -1141,6 +1143,8 @@ export class AdtHttpClient {
 
       const token = usableCsrfToken(response);
       if (!token) {
+        const sessionEnded = browserSessionEnded(this.config, path, response);
+        if (sessionEnded) throw sessionEnded;
         if (response.status === 401) {
           if (this.isCookieAuthMode()) this.clearCookiesAndMark();
           this.notifyUnauthorized(path);

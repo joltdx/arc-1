@@ -17,6 +17,7 @@ import {
   AdtSafetyError,
   classifySapDomainError,
 } from '../adt/errors.js';
+import { BrowserSessionEndedError } from '../adt/http-browser.js';
 import { AdtAnalysisDeadlineError, AdtRequestBudgetError } from '../adt/request-attempt-budget.js';
 /**
  * Scope required for each tool.
@@ -255,6 +256,9 @@ function buildBaseErrorMessage(
     return `${detail}\nPublish completion is unconfirmed. Use SAPRead to verify publication state before another publish.`;
   }
   if (err instanceof AdtApiError) {
+    if (err instanceof BrowserSessionEndedError) {
+      return `${message}\n\nHint: Ask the user to log on to SAP again in this browser (for example by reloading the app), then retry.`;
+    }
     if (
       tool === 'SAPNavigate' &&
       args.action === 'relations' &&
