@@ -151,6 +151,7 @@
     "@types/supertest": "^7.2.1",
     "@vitest/coverage-v8": "^5.0.5",
     "audit-ci": "7.1.0",
+    "buffer": "^6.0.3",
     "esbuild": "^0.28.1",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",
