@@ -198,13 +198,16 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 
 - `credentials: 'include'`; never set `Cookie` or `User-Agent` (forbidden or ignored).
 - `redirect: 'manual'` yields an opaque response (status 0) in browsers; the attempt-budget path treats `opaqueredirect`
-  like a 3xx (done in 2.5).
-- Session expiry: observed on 7.57 as **400 `text/html`** ("Session timed out"), no redirect. Other setups may
-  follow a SAML/login redirect and get 200 + HTML. Detect by HTML content type on `/sap/bc/adt` (or
-  `response.redirected`); retry once, refresh CSRF, then raise a typed "re-authentication required" error.
-  Since 1.7.0 (#1046), a stateful CSRF fetch that gets 400 on both HEAD and GET retries the GET once **without**
-  the session header. An expired session (also 400) takes that path first, so the expiry handling must not stack
-  a second retry on it or report the HTML page as a CSRF failure.
+  like a 3xx (done in 2.5). Since Phase 4 every browser request uses `redirect: 'manual'`: system B (7.57)
+  redirects an unauthenticated ADT request to its Entra ID IdP, and a followed cross-origin redirect fails as an
+  opaque CORS network error that nothing retries.
+- Session expiry: observed on 7.57 as **400 `text/html`** ("Session timed out"), no redirect; a missing logon on
+  7.31 is 401 `text/html`; on system B without a session, a 302 to Entra ID, then (once SAP has set
+  `OIDCTokenRequested`) a Basic 401 challenge. **Done (Phase 4):** `browserSessionEnded()` (`http-browser.ts`)
+  treats a 401, a redirect (status 0), a logon page or a 400 HTML page as SAP's logon layer;
+  `request()` retries it once through the 401 path (CSRF refetch for writes), then raises `BrowserSessionEndedError`
+  (401), and `dispatch.ts` hints "log on to SAP again in this browser". The #1046 headerless CSRF GET (1.7.0)
+  stays the only extra CSRF retry; its final failure is reported as the session end, not as a CSRF failure.
 - `sap-contextid` has path `/sap/bc/adt` (HttpOnly on 7.57, not on 7.31): a host page outside that path cannot
   read it either way, so the close request goes without the `sap-contextid` header (verified to work on both; on
   pre-7.50 + `abapfs_extensions` a stateless request to a 404 close path still ends the context). All tabs share it, and any explicit `stateless` ADT request ends
@@ -261,9 +264,10 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   `tests/unit/browser/http-bundle.test.ts`. `http.ts` budget +4 (body lives in `http-browser.ts`)
   - [x] Security-session gate (1.7.0, #1043): with no jar the first cold request goes alone, then the client fans
     out; a 401 reset re-arms it. Covered in `http-browser.test.ts`.
-  - [x] Headerless CSRF retry (1.7.0, #1046): expired-session baseline (400 `text/html`) locked in: stateless CSRF =
-    HEAD + GET, stateful adds the headerless GET, then a typed 400. Phase 4 turns this into a re-auth error.
-  - Phase 4: repeat spike test 9 (log off, then write) through the real ARC-1 code path on 7.57.
+  - [x] Headerless CSRF retry (1.7.0, #1046): stateless CSRF = HEAD + GET, stateful adds the headerless GET; since
+    Phase 4 the final failure is `BrowserSessionEndedError`.
+  - Phase 4: spike test 9 (log off, then call a tool) repeated through the real ARC-1 code path on 7.57: silent
+    success. The write variant comes with Phase 5's live CRUD.
 - [x] 2.6 AFF schemas: `node:sea` stand-in serves them from the bundle via the validator's existing single-executable
   switch (no upstream change). A unit test fails if `src/aff/schemas/` gains a file the stand-in lacks (the
   validator would otherwise skip validation for that type silently)
@@ -315,9 +319,25 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 
 ### Phase 4: Read-only end-to-end
 
-- [ ] Browser test harness (Playwright or vitest browser mode) loading the bundle in a real Worker
-- [ ] Dev proxy setup (§7) against a real SAP test system: SAPRead, SAPSearch, SAPNavigate, feature probe, release detection
-- [ ] Re-auth error surfaces as a clear tool error
+Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
+
+- [x] Browser test harness: `npm run test:browser-live` (`tests/browser-live/`, `vitest.browser-live.config.ts`)
+  builds the bundle and runs it in a module Worker in headless Chromium (`playwright-core` devDependency, browser
+  via `npx playwright-core install chromium-headless-shell`). The backend side is an unmodified MCP SDK `Client`
+  whose transport relays each message through the page. Like `test:integration`, it needs SAP credentials and
+  is not in CI
+- [x] Dev proxy setup (§7): `scripts/browser/dev-server.mjs` (`npm run dev:browser`) serves the harness page and
+  the bundle and proxies `/sap/*`; also used by the live suite. Unit-tested in `tests/unit/browser/dev-server.test.ts`
+- [x] Live reads on 7.31 (system A): SAPRead, SAPSearch, SAPNavigate, feature probe, audit user, same-origin and no
+  `stateless` header. Each call must match Node ARC-1 (`handleToolCall`, same config) exactly; `SAPRead SYSTEM`
+  and structure references fail on 7.31 in both. Release detection: not possible on 7.31 (no components feed),
+  same as Node
+- [x] Same suite on 7.57 (system B): 9/9, `SAPRead SYSTEM` works there. Found and fixed on the way: the IdP
+  redirect (manual redirects, above) and `SameSite=None` cookies dropped by the dev proxy on plain HTTP; the
+  suite now logs the browser context on once before the runtime starts
+  - [x] Spike test 9 manually through `npm run dev:browser` in Edge on system B (log off, then call a tool):
+    silent success, no credentials dialog (2026-10-22)
+- [x] Re-auth error surfaces as a clear tool error (§4.4); live on 7.31 and 7.57 without a logon
 - [ ] Platform team wires the relay transport (outside this repo) and confirms backend MCP client works unchanged
 
 ### Phase 5: Writes
@@ -362,7 +382,8 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
    still leaves the lock until timeout.
 4. **Background-tab throttling** during ATC polling / long activation.
 5. **Bundle size**: 4.2 MB minified, ~1 MB gzipped (2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. Lazy-loading
-   abaplint needs upstream async changes in 12 modules (Phase 3 note); decide with Phase 4 load times.
+   abaplint needs upstream async changes in 12 modules (Phase 3 note). Phase 4 on localhost: worker ready in
+   280–360 ms; a real network download from the ABAP server is still to be measured in the host app.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
 8. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
@@ -374,7 +395,14 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 
 ## 7. Local development setup
 
-- Dev server (e.g. Vite) serving the test page **and** proxying `/sap/*` to the SAP test system, so the browser sees a single origin. Log in once through the proxy.
+- `npm run build:browser && npm run dev:browser` (`--target <url>`, default `TEST_SAP_URL`/`SAP_URL` from `.env`;
+  `--port`, default 5173) serves the harness page **and** proxies `/sap/*` to the SAP test system, so the browser
+  sees a single origin. Log in once through the proxy with a Basic challenge: open `/sap/bc/adt/discovery` on a
+  Basic system. On an SSO system (system B) that URL first redirects to the IdP, whose callback goes to the real
+  SAP host, so the session never reaches the proxy origin; open a path that challenges directly instead (system B:
+  `/sap/opu/odata/UI5/ABAP_REPOSITORY_SRV`), or the same ADT URL a second time. Then start the runtime and call
+  tools from the page. The proxy drops `Domain` (and `Secure` and `SameSite=None` on plain HTTP) from SAP cookies
+  and maps SAP-origin redirects back to the local origin.
 - Never commit SAP URLs, users or cookies; use `.env` (gitignored) for the proxy target.
 - Use `$TMP` and `generateUniqueName()`-style names for write tests; clean up best-effort.
 
