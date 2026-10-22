@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ARC-1 browser harness</title>
+    <style>
+      body { font: 14px system-ui, sans-serif; margin: 16px; max-width: 1100px; }
+      fieldset { margin-bottom: 12px; display: grid; gap: 6px; }
+      textarea, input { font: 13px ui-monospace, monospace; width: 100%; box-sizing: border-box; }
+      pre { background: #f4f4f4; padding: 8px; white-space: pre-wrap; max-height: 60vh; overflow: auto; }
+      .row { display: flex; gap: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>ARC-1 browser harness</h1>
+    <p>
+      Local test page for the browser runtime (docs/plans/2026-10-20-browser-embedded-runtime.md). <code>/sap/*</code>
+      on this origin is proxied to the SAP system; log on there first, for example by opening
+      <a href="/sap/bc/adt/discovery" target="_blank">/sap/bc/adt/discovery</a>.
+    </p>
+    <fieldset>
+      <legend>Runtime</legend>
+      <label>Config (JSON, <code>BrowserServerConfig</code>)
+        <textarea id="config" rows="3">{}</textarea></label>
+      <label>SAP user (shown by SAPRead SYSTEM and in audit events)<input id="user" /></label>
+      <div class="row"><button id="start">Start</button><button id="list" disabled>tools/list</button>
+        <button id="audit">Audit events</button></div>
+    </fieldset>
+    <fieldset>
+      <legend>tools/call</legend>
+      <input id="tool" value="SAPRead" />
+      <textarea id="args" rows="3">{"type": "SYSTEM"}</textarea>
+      <div class="row"><button id="call" disabled>Call</button></div>
+    </fieldset>
+    <pre id="output"></pre>
+    <script type="module" src="/harness/harness.js"></script>
+  </body>
+</html>
