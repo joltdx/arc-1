@@ -3,8 +3,18 @@
  * other test in that run would pass against the real Node module and prove nothing.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const readFileSync = vi.hoisted(() => vi.fn());
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  readFileSync.mockImplementation(actual.readFileSync);
+  return { ...actual, readFileSync };
+});
+
 import { sleepWithinRequestBudget } from '../../../src/adt/http-deadline.js';
 import { sourceHash } from '../../../src/adt/source-precondition.js';
+import { assembleChunks } from '../../../src/adt/stored-text/chunks.js';
+import { resetValidatorCache, validateAffHeader } from '../../../src/aff/validator.js';
 import { requestContext } from '../../../src/server/context.js';
 
 afterEach(() => {
@@ -31,5 +41,21 @@ describe('browser node-shims redirect', () => {
     const spy = vi.spyOn(globalThis, 'setTimeout');
     await sleepWithinRequestBudget(1);
     expect(spy).toHaveBeenCalled();
+  });
+
+  it('routes node:sea/url/path in the AFF validator to the embedded schemas', () => {
+    resetValidatorCache();
+    expect(validateAffHeader('INTF', { description: 42 }).valid).toBe(false);
+    // Without the redirect, the validator reads src/aff/schemas/intf-v1.json from disk.
+    expect(readFileSync.mock.calls.some(([path]) => String(path).includes('aff'))).toBe(false);
+  });
+
+  it('gives shared source the buffer package as Buffer', () => {
+    const key = { TDOBJECT: 'TEXT', TDNAME: 'Z_GUARD', TDID: 'ST', TDSPRAS: 'E' };
+    const row = { ...key, MANDT: '001', RELID: 'TX', SRTF2: '0 ', CLUSTR: '2 ', CLUSTD: '0aff'.padEnd(15804, '0') };
+    const bytes = assembleChunks([row], key, '001');
+    // Node's own Buffer would pass this check; the injected package's Buffer is a different class.
+    expect(Buffer.isBuffer(bytes)).toBe(false);
+    expect([...bytes]).toEqual([0x0a, 0xff]);
   });
 });

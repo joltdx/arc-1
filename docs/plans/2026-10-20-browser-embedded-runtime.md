@@ -142,7 +142,7 @@ behavior differs.**
   listed with reasons: Node-only files (OAuth, multi-target, Node HTTP server, signals, CLI subprocess) and three
   tests that run tool calls concurrently on purpose. A guard test (`tests/unit/browser/node-shims-redirect.shimtest.ts`)
   fails if any redirect silently stops applying. Parity with real Node and an esbuild bundle proof run in the
-  normal suite (`tests/unit/browser/node-shims-{crypto,runtime}.test.ts`).
+  normal suite (`tests/unit/browser/node-shims-{crypto,runtime,modules}.test.ts`, `http-bundle.test.ts`).
 - The `node:async_hooks` stand-in keeps one active store per `AsyncLocalStorage` and restores the previous one
   when a run settles. That equals Node only for strictly nested runs, which holds because the browser runtime
   serializes tool calls. Overlapping runs throw (both calls fail) instead of sharing a request id, cancellation
@@ -170,16 +170,16 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 | Outgoing HTTP | `src/adt/http.ts` (undici `Agent`/`Client`), `bounded-response.ts` (`node:stream`, undici), `request-attempt-budget.ts` (undici) | **Done (2.5):** `AdtHttpConfig.browserFetch` branch in `sendRequest()` (body in `http-browser.ts`); undici replaced by a throwing bundle-only stand-in. Byte-bounding (`capResponseBody`) was already WHATWG streams; the `node:stream`/undici imports in `bounded-response.ts` are type-only, and the Node-stream code there is the out-of-scope Connectivity proxy |
 | Cookie jar | `http.ts` `cookieJar`, `cookies.ts` (`node:fs`) | **Done (2.5), no separate option needed:** browsers hide `Set-Cookie` from scripts and drop a script-set `Cookie`, so the jar stays empty by itself; `browserFetch` refuses cookie options and strips `Cookie`. `cookies.ts` gets a bundle-only `node:fs` stand-in scoped to that file |
 | Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | **Transport done (2.5):** close is sent without `sap-contextid` whenever the clone sent a stateful request (the jar cannot see the HttpOnly cookie). Write queue (`navigator.locks`) and `pagehide` close remain Phase 5 |
-| Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | `node:async_hooks` stand-in: single-slot `AsyncLocalStorage`, valid because tool calls are serialized |
+| Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | **Done (2.4):** `node:async_hooks` stand-in: single-slot `AsyncLocalStorage`, valid because tool calls are serialized |
 | Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | **Done (2.2):** `node:crypto` stand-in, sync pure-JS sha256 (`@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
-| Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | WAF gzip: unsupported in browser (config refuses); stored text: `DecompressionStream` or exclude in v1 |
-| Timers | `http-deadline.ts`, `ci-quality.ts` (`node:timers/promises`) | `node:timers/promises` stand-in (`setTimeout` promise) |
-| Files | `aff/validator.ts` (schema files; since 1.7.0 also `node:sea` assets via `readSchemaText`), `lint/config-builder.ts`, `server/deny-actions.ts` | AFF schemas bundled/lazy-imported (`readSchemaText` is the natural seam point); lint config + deny actions passed as objects |
+| Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | **Done (2.7):** throwing bundle-only stand-ins scoped to both files. WAF gzip is refused with `browserFetch`. **Stored text is not in v1:** the decoder needs inflate's consumed-byte count (`engine.bytesWritten`), which `DecompressionStream` does not report |
+| Timers | `http-deadline.ts`, `ci-quality.ts` (`node:timers/promises`) | **Done (2.3):** `node:timers/promises` stand-in (`setTimeout` promise) |
+| Files | `aff/validator.ts` (schema files; since 1.7.0 also `node:sea` assets via `readSchemaText`), `lint/config-builder.ts`, `server/deny-actions.ts` | **Done (2.6/2.7), no upstream change:** the validator's existing single-executable switch serves the schemas: a `node:sea` stand-in (`isSea()` true, `getAsset` from the 7 bundled schemas, 56 KB) plus `node:url`/`node:path` stand-ins for its module-load path. Lint config files and deny-action files are Node-only config: `node:fs`/`node:os`/`node:path` stand-ins that throw, scoped to those files. A custom abaplint config as an object is a possible later addition |
 | Cache | `cache/sqlite.ts`, `cache/sqlite-driver.ts` (`better-sqlite3` or `node:sqlite` via `node:module`, since 1.7.0) | Memory cache only |
 | Server setup | `server/server.ts` `createServer` (express, XSUAA, multi-target, plugins, stdio, `node:http`) | **Do not reuse.** New small `src/browser/` entry composing `AdtClient` + `getToolDefinitions` + `handleToolCall` |
-| Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | `ConsoleSink` + host sinks via `addSink`; memory envelope = fixed config value |
-| Node globals (no import, so no redirect or esbuild error catches them) | `Buffer` (~20 shared uses: `byteLength`, base64/hex, `concat`, stored-text chunks), `process.env` (`http.ts` `ARC1_LOG_HTTP_DEBUG`, server helpers), `process.stderr` (logger, stderr sink) | 2.9. `process.env`: esbuild `define` to `{}` (env config is unset in the browser). `Buffer`: decide between injecting the `buffer` package (faithful port) or a stand-in for the used surface; either way the shimmed test run must use it too. `process.stderr`: 2.8. Tracked per file by the ratchet in `tests/unit/browser/http-bundle.test.ts` |
-| Out of scope | `oauth.ts`, `abapgit.ts` (`node:net`), destinations, multi-target, plugin loader | Not reachable from browser entry; enforced by bundle guard |
+| Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | **Done (2.8), no upstream change:** the injected `process.stderr.write` forwards to `console.error`, so the default `StderrSink` acts as a console sink; host sinks via `logger.addSink`. `runtime-memory.ts`: not in the handler graph |
+| Node globals (no import, so no redirect or esbuild error catches them) | `Buffer` (~20 shared uses: `byteLength`, base64/hex, `concat`, stored-text chunks), `process.env` (`http.ts` `ARC1_LOG_HTTP_DEBUG`, server helpers), `process.stderr` (logger, stderr sink) | **Done (2.9):** esbuild injects `src/browser/globals.ts`: `Buffer` from the `buffer` package, and a minimal `process` (empty `env`, `stderr.write` → console). The shimmed test run imports the same `Buffer` into shared source (`process` stays Node's there, since tests set env vars). `buffer` refuses `'base64url'` loudly; its only user is bearer JWT decoding, which `browserFetch` refuses |
+| Out of scope | `oauth.ts`, `abapgit.ts` (`node:net`), destinations, multi-target, plugin loader | `abapgit.ts` `isIP`: throwing bundle-only stand-in (no re-implemented SSRF check). Dependencies requiring bare `crypto` (abaplint downport rule: sha1; rate-limiter-flexible cluster limiter) get the `node:crypto` stand-in, scoped to those files |
 
 ### 4.4 Browser-specific HTTP behavior to handle
 
@@ -251,18 +251,30 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   - [x] Headerless CSRF retry (1.7.0, #1046): expired-session baseline (400 `text/html`) locked in: stateless CSRF =
     HEAD + GET, stateful adds the headerless GET, then a typed 400. Phase 4 turns this into a re-auth error.
   - Phase 4: repeat spike test 9 (log off, then write) through the real ARC-1 code path on 7.57.
-- [ ] 2.6 AFF schema loader seam (fs vs bundled)
-- [ ] 2.7 Lint config / deny-actions accept in-memory config without fs
-- [ ] 2.8 Logger: `ConsoleSink`; no hard dependency on `StderrSink` from shared code
-- [ ] 2.9 Node globals: `process.env` via esbuild `define`; `Buffer` decision (inject `buffer` package vs stand-in), applied
-  to the shimmed test run too; shrink the ratchet in `http-bundle.test.ts` as each lands
+- [x] 2.6 AFF schemas: `node:sea` stand-in serves them from the bundle via the validator's existing single-executable
+  switch (no upstream change). A unit test fails if `src/aff/schemas/` gains a file the stand-in lacks (the
+  validator would otherwise skip validation for that type silently)
+- [x] 2.7 Lint config files / deny-action files: Node-only config, throwing stand-ins scoped to those files; the browser
+  passes deny actions as an array. Also covered: stored-text decoder, `abapgit.ts` `isIP`, bare `crypto` in dependencies
+- [x] 2.8 Logger: no code change; the injected `process.stderr` routes the default sink to the console
+- [x] 2.9 Node globals: `buffer` package + minimal `process` injected (`src/browser/globals.ts`)
+- [x] Redirect table is one rule list in `scripts/browser/node-shims.mjs` (per-rule `importers` scope and
+  `bundleOnly`); `browserBuildOptions()` is the shared esbuild setup for Phase 3
+- [x] `tests/unit/browser/http-bundle.test.ts` runs the bundled HTTP layer, logger, validator and a `Buffer` user in a
+  vm context with only web APIs (no Node globals): requests, CSRF, console logging, embedded schemas, `Buffer` parity
+- [x] Whole handler graph (`src/handlers/dispatch.ts`) bundles for the browser: 2,018 modules, ~7.3 MB unminified
+  (mostly abaplint; Phase 3 lazy-loads it)
 - [ ] Each PR: roadmap check, size-budget check, PR template filled (live SAP testing N/A for pure refactors; state it)
 
 ### Phase 3: Browser entry + bundle
 
 - [ ] `src/browser/index.ts` (`createBrowserServer`), `config.ts` (browser defaults and validation; reuse `DEFAULT_CONFIG` / `validateConfig` where possible), `message-port-transport.ts`
 - [ ] `package.json` `exports["./browser"]`; mark `@experimental` like `arc-1/public`
-- [ ] Bundle script `build:browser` (esbuild, ESM, worker-targeted); lazy-load abaplint and AFF schemas
+- [ ] Bundle script `build:browser` (esbuild, ESM, worker-targeted, `browserBuildOptions()`); lazy-load abaplint
+- [ ] `getEffectiveUser()` returns `''` in the browser (no SAP user configured, no bearer token): decide how the
+  runtime learns the user for `adtcore:responsible` on create and `SAPRead SYSTEM` (host-supplied, or a SAP call)
+- [ ] Browser config refuses or hides what v1 does not support: stored text (`SAPQuery long_text`), abapGit,
+  WAF gzip, cookie/credential auth
 - [ ] CI guard `scripts/ci/check-browser-bundle.mjs`: fail on forbidden imports; enforce a size budget (fails on its own staleness, Playbook §5)
 - [ ] Unit tests: `createBrowserServer` + `InMemoryTransport` → `initialize`, `tools/list`, `tools/call` against `mock-fetch`
 - [ ] Snapshot test: browser `tools/list` for read-only and full configs (new fixtures under `tests/fixtures/tool-definitions/browser-*.json`)
@@ -310,7 +322,7 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 5. **Bundle size** (abaplint is several MB): lazy-load; lint-before-write could default off in browser.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
-8. **Open:** audit gate shape (sink health vs separate gate); whether stored-text (SAPscript) is in v1; BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
+8. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
 9. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
    from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
    and never send `stateless` on reads.

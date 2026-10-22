@@ -5,10 +5,11 @@
  * call shapes found in shared code are implemented; anything else throws, so a new upstream use
  * fails the shimmed test run instead of silently hashing differently.
  *
- * Supported: `createHash('sha256').update(string | Uint8Array[, 'utf8']).digest('hex')` and
- * `randomBytes(n).toString('hex')`.
+ * Supported: `createHash('sha256' | 'sha1').update(string | Uint8Array[, 'utf8']).digest('hex')` and
+ * `randomBytes(n).toString('hex')`. sha1 is only for abaplint's downport rule, which imports bare `crypto`.
  */
 
+import { sha1 } from '@noble/hashes/legacy.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
 
@@ -25,8 +26,9 @@ export interface Hash {
 }
 
 export function createHash(algorithm: string): Hash {
-  if (algorithm !== 'sha256') throw new UnsupportedShimError(`createHash('${algorithm}')`);
-  const state = sha256.create();
+  const hasher = algorithm === 'sha256' ? sha256 : algorithm === 'sha1' ? sha1 : undefined;
+  if (!hasher) throw new UnsupportedShimError(`createHash('${algorithm}')`);
+  const state = hasher.create();
   let finished = false;
   const hash: Hash = {
     update(data, inputEncoding) {
