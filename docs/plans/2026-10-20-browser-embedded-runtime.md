@@ -141,7 +141,11 @@ pick the browser variant:
 Fallback if this complicates `tsc`/vitest: runtime injection via a `platform` object set once at startup.
 Decide in Phase 2.1 and use one technique consistently.
 
-### 4.3 Node-only inventory (verified 2026-10-20 against upstream main `1ff575d9`)
+Upstream precedent (1.7.0, #1027): the single-executable build bundles with esbuild (`scripts/build-sea.mjs`,
+`esbuild` is already a devDependency) and switches platform behavior inside the module (`isSea()` in
+`aff/validator.ts`, lazy `createRequire` in `cache/sqlite-driver.ts`), not through package `imports`.
+
+### 4.3 Node-only inventory (verified 2026-10-20 against upstream main `1ff575d9`; re-checked 2026-10-22 at `7b210cbf`, v1.7.0)
 
 | Area | Files | Browser replacement |
 | --- | --- | --- |
@@ -152,8 +156,8 @@ Decide in Phase 2.1 and use one technique consistently.
 | Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | `#platform/hash` (sync, pure-JS sha256, e.g. `@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
 | Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | WAF gzip: unsupported in browser (config refuses); stored text: `DecompressionStream` or exclude in v1 |
 | Timers | `http-deadline.ts`, `ci-quality.ts` (`node:timers/promises`) | `setTimeout` promise |
-| Files | `aff/validator.ts` (schema files), `lint/config-builder.ts`, `server/deny-actions.ts` | AFF schemas bundled/lazy-imported; lint config + deny actions passed as objects |
-| Cache | `cache/sqlite.ts` (`better-sqlite3`) | Memory cache only |
+| Files | `aff/validator.ts` (schema files; since 1.7.0 also `node:sea` assets via `readSchemaText`), `lint/config-builder.ts`, `server/deny-actions.ts` | AFF schemas bundled/lazy-imported (`readSchemaText` is the natural seam point); lint config + deny actions passed as objects |
+| Cache | `cache/sqlite.ts`, `cache/sqlite-driver.ts` (`better-sqlite3` or `node:sqlite` via `node:module`, since 1.7.0) | Memory cache only |
 | Server setup | `server/server.ts` `createServer` (express, XSUAA, multi-target, plugins, stdio, `node:http`) | **Do not reuse.** New small `src/browser/` entry composing `AdtClient` + `getToolDefinitions` + `handleToolCall` |
 | Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | `ConsoleSink` + host sinks via `addSink`; memory envelope = fixed config value |
 | Out of scope | `oauth.ts`, `abapgit.ts` (`node:net`), destinations, multi-target, plugin loader | Not reachable from browser entry; enforced by bundle guard |
@@ -165,6 +169,9 @@ Decide in Phase 2.1 and use one technique consistently.
 - Session expiry: observed on 7.57 as **400 `text/html`** ("Session timed out"), no redirect. Other setups may
   follow a SAML/login redirect and get 200 + HTML. Detect by HTML content type on `/sap/bc/adt` (or
   `response.redirected`); retry once, refresh CSRF, then raise a typed "re-authentication required" error.
+  Since 1.7.0 (#1046), a stateful CSRF fetch that gets 400 on both HEAD and GET retries the GET once **without**
+  the session header. An expired session (also 400) takes that path first, so the expiry handling must not stack
+  a second retry on it or report the HTML page as a CSRF failure.
 - `sap-contextid` has path `/sap/bc/adt` (HttpOnly on 7.57, not on 7.31): a host page outside that path cannot
   read it either way, so the close request goes without the `sap-contextid` header (verified to work on both; on
   pre-7.50 + `abapfs_extensions` a stateless request to a 404 close path still ends the context). All tabs share it, and any explicit `stateless` ADT request ends
@@ -209,6 +216,11 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 - [ ] 2.3 Timers
 - [ ] 2.4 Request-context provider (`context.ts`); keep `AsyncLocalStorage` as Node default
 - [ ] 2.5 HTTP: `fetchImpl` + `cookieMode` in `AdtHttpClient` config; bounded response on web streams; manual-redirect handling
+  - Security-session gate (1.7.0, #1043, `security-session-gate.ts`): with no cookie jar, `hasSecuritySessionCookie`
+    is always false, so only the first request runs alone until one succeeds. Unit-test that the gate opens with
+    `cookieMode: 'browser'` and that a 401 reset re-arms it.
+  - Headerless CSRF retry (1.7.0, #1046): see §4.4; unit-test expired-session (400 `text/html`) through that path.
+  - Phase 4: repeat spike test 9 (log off, then write) through the real ARC-1 code path on 7.57.
 - [ ] 2.6 AFF schema loader seam (fs vs bundled)
 - [ ] 2.7 Lint config / deny-actions accept in-memory config without fs
 - [ ] 2.8 Logger: `ConsoleSink`; no hard dependency on `StderrSink` from shared code
