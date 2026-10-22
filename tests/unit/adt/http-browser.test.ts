@@ -10,6 +10,7 @@ vi.mock('undici', async (importOriginal) => ({
 }));
 const { AdtHttpClient } = await import('../../../src/adt/http.js');
 const { AdtApiError } = await import('../../../src/adt/errors.js');
+const { BrowserSessionEndedError } = await import('../../../src/adt/http-browser.js');
 
 const browserFetch = vi.fn<typeof fetch>();
 const config = { baseUrl: 'https://sap.example.com', client: '001', browserFetch };
@@ -72,7 +73,7 @@ describe('AdtHttpClient browserFetch transport', () => {
     const { url, init, headers } = call(0);
     expect(url.searchParams.get('sap-client')).toBe('001');
     expect(init.credentials).toBe('include');
-    expect(init.redirect).toBeUndefined();
+    expect(init.redirect).toBe('manual');
     expect(headers.Accept).toBe('text/plain');
     expect(headers).not.toHaveProperty('Cookie');
     expect(headers).not.toHaveProperty('User-Agent');
@@ -180,22 +181,113 @@ describe('AdtHttpClient browserFetch transport', () => {
     });
   });
 
-  describe('expired session baseline (spike test 9: 400 text/html)', () => {
+  describe('session end (spike test 9: 400 text/html after logoff)', () => {
     const expired = () => mockResponse(400, '<html>Session timed out</html>', { 'content-type': 'text/html' });
+    const html401 = () => mockResponse(401, '<html>Logon Error Message</html>', { 'content-type': 'text/html' });
+    const source = '/sap/bc/adt/programs/programs/Z/source/main';
 
-    it('stateless CSRF fetch: HEAD and GET, then a typed 400', async () => {
+    it('retries once and recovers when the browser logs on again silently', async () => {
+      browserFetch
+        .mockResolvedValueOnce(expired())
+        .mockResolvedValueOnce(mockResponse(200, 'REPORT z.', { 'content-type': 'text/plain' }));
+      const response = await new AdtHttpClient(config).get(source);
+      expect(response.body).toBe('REPORT z.');
+      expect(browserFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('raises BrowserSessionEndedError (401) when the session stays gone', async () => {
+      for (const ended of [expired, html401]) {
+        browserFetch.mockReset();
+        browserFetch.mockImplementation(async () => ended());
+        const error = await new AdtHttpClient(config).get(source).catch((err: unknown) => err);
+        expect(error).toBeInstanceOf(BrowserSessionEndedError);
+        expect(error).toMatchObject({ statusCode: 401, path: source });
+        expect((error as Error).message).toMatch(
+          /no longer logged on to SAP in this browser \(SAP answered HTTP 40[01] with an HTML page\)/,
+        );
+        expect(browserFetch).toHaveBeenCalledTimes(2);
+      }
+    });
+
+    it('treats a redirect (an SSO IdP on another origin) as a session end after one retry', async () => {
+      const opaque = () =>
+        ({ ...mockResponse(200, ''), status: 0, ok: false, type: 'opaqueredirect', body: null }) as unknown as Response;
+      browserFetch.mockImplementation(async () => opaque());
+      const error = await new AdtHttpClient(config).get(source).catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(BrowserSessionEndedError);
+      expect((error as Error).message).toContain('SAP answered with a redirect to a logon page');
+      expect(browserFetch).toHaveBeenCalledTimes(2);
+      expect(call(1).init.redirect).toBe('manual');
+    });
+
+    it('stateless CSRF fetch: a redirect is a session end, not a missing token', async () => {
+      browserFetch.mockImplementation(
+        async () =>
+          ({
+            ...mockResponse(200, ''),
+            status: 0,
+            ok: false,
+            type: 'opaqueredirect',
+            body: null,
+          }) as unknown as Response,
+      );
+      await expect(new AdtHttpClient(config).fetchCsrfToken()).rejects.toBeInstanceOf(BrowserSessionEndedError);
+    });
+
+    it('treats a logon page as a session end', async () => {
+      browserFetch.mockImplementation(async () =>
+        mockResponse(200, '<html><form action="/sap/bc/ui2/login">sap-user</form></html>', {
+          'content-type': 'text/html',
+        }),
+      );
+      await expect(new AdtHttpClient(config).get(source)).rejects.toBeInstanceOf(BrowserSessionEndedError);
+    });
+
+    it('refetches the CSRF token on the write retry', async () => {
+      browserFetch
+        .mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'OLD' }))
+        .mockResolvedValueOnce(expired())
+        .mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'NEW' }))
+        .mockResolvedValueOnce(mockResponse(200, 'ok'));
+      await new AdtHttpClient(config).post('/sap/bc/adt/programs/programs', '<xml/>', 'application/xml');
+      expect(call(3).init.method).toBe('POST');
+      expect(call(3).headers['X-CSRF-Token']).toBe('NEW');
+    });
+
+    it('stateless CSRF fetch: HEAD and GET, then the session error instead of a CSRF failure', async () => {
       browserFetch.mockImplementation(async () => expired());
       const client = new AdtHttpClient(config);
-      await expect(client.fetchCsrfToken()).rejects.toMatchObject({ statusCode: 400 });
+      await expect(client.fetchCsrfToken()).rejects.toBeInstanceOf(BrowserSessionEndedError);
       expect(browserFetch.mock.calls.map((_c, i) => call(i).init.method)).toEqual(['HEAD', 'GET']);
     });
 
-    it('stateful CSRF fetch adds the #1046 headerless GET before failing', async () => {
+    it('stateful CSRF fetch keeps the #1046 headerless GET and adds no retry of its own', async () => {
       browserFetch.mockImplementation(async () => expired());
       const client = new AdtHttpClient({ ...config, sessionType: 'stateful' });
-      await expect(client.fetchCsrfToken()).rejects.toMatchObject({ statusCode: 400 });
+      await expect(client.fetchCsrfToken()).rejects.toBeInstanceOf(BrowserSessionEndedError);
       const sessionHeaders = browserFetch.mock.calls.map((_c, i) => call(i).headers['X-sap-adt-sessiontype']);
       expect(sessionHeaders).toEqual(['stateful', 'stateful', undefined]);
+    });
+
+    it('leaves ADT errors alone: a 400 with an XML body is not retried', async () => {
+      browserFetch.mockResolvedValue(
+        mockResponse(400, '<exc:exception><message>bad</message></exc:exception>', {
+          'content-type': 'application/xml',
+        }),
+      );
+      const error = await new AdtHttpClient(config).get(source).catch((err: unknown) => err);
+      expect(error).not.toBeInstanceOf(BrowserSessionEndedError);
+      expect(error).toMatchObject({ statusCode: 400 });
+      expect(browserFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not change the Node transport: a 400 HTML page stays a single 400', async () => {
+      undiciFetch.mockResolvedValue(expired());
+      const client = new AdtHttpClient({ baseUrl: 'https://sap.example.com', username: 'u', password: 'p' });
+      const error = await client.get(source).catch((err: unknown) => err);
+      expect(error).not.toBeInstanceOf(BrowserSessionEndedError);
+      expect(error).toMatchObject({ statusCode: 400 });
+      expect(undiciFetch).toHaveBeenCalledTimes(1);
     });
   });
 
