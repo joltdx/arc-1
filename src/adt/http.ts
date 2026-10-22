@@ -16,6 +16,7 @@ import { connectivityProxyResponse, prepareBoundedResponse } from './bounded-res
 import { resolveCookies } from './cookies.js';
 import { resolveAcceptType, resolveContentType } from './discovery.js';
 import { AdtApiError, AdtNetworkError, AdtResponseLimitError } from './errors.js';
+import { assertBrowserCompatible, sendBrowserRequest } from './http-browser.js';
 import {
   type AdtRequestOptions,
   awaitWithinRequestBudget,
@@ -154,6 +155,8 @@ export interface AdtHttpConfig {
   onUnauthorized?: (context: { path: string; statusCode: 401 }) => void;
   /** Optional concurrency limiter shared across requests */
   semaphore?: Semaphore;
+  /** Browser runtime: same-origin fetch on the user's SAP session instead of undici (see http-browser.ts). */
+  browserFetch?: typeof fetch;
 }
 
 /** Response from an ADT HTTP request */
@@ -204,7 +207,10 @@ export class AdtHttpClient {
   private readonly securitySessionGate = new SecuritySessionGate();
   /** Shared by stateful clones so one rejected Basic credential cannot fan out internally. */
   private readonly authenticationAttemptState: AuthenticationAttemptState;
+  /** Browser mode: whether this clone opened a stateful context (the jar cannot see `sap-contextid`). */
+  private browserStatefulRequestSent = false;
   constructor(config: AdtHttpConfig, authenticationAttemptState?: AuthenticationAttemptState) {
+    if (config.browserFetch) assertBrowserCompatible(config);
     this.config = config;
     this.userAgent = resolveSapUserAgent(config.userAgent);
     this.authenticationAttemptState = authenticationAttemptState ?? { rejected: false, tail: Promise.resolve() };
@@ -325,7 +331,8 @@ export class AdtHttpClient {
   /** Close the SAP application context without changing the completed operation's result. */
   private async closeStatefulSession(options?: AdtRequestOptions): Promise<boolean | undefined> {
     const contextId = this.cookieJar.get('sap-contextid');
-    if (!contextId || contextId === '0') return;
+    // A browser keeps sap-contextid HttpOnly and sends it itself; close whenever this clone went stateful.
+    if (this.config.browserFetch ? !this.browserStatefulRequestSent : !contextId || contextId === '0') return;
 
     // Eclipse ADT changes the same context to stateless while sending its dedicated close request.
     // This client belongs only to withStatefulSession(), so it is not reused after the transition.
@@ -334,7 +341,7 @@ export class AdtHttpClient {
       try {
         await this.get(
           '/sap/bc/adt/core/http/sessions',
-          { Accept: '*/*', 'sap-adt-purpose': 'close-session', 'sap-contextid': contextId },
+          { Accept: '*/*', 'sap-adt-purpose': 'close-session', ...(contextId ? { 'sap-contextid': contextId } : {}) },
           { probe: true, ...options },
         );
         return true;
@@ -1394,6 +1401,10 @@ export class AdtHttpClient {
     options?: AdtRequestOptions,
   ): Promise<Response> {
     throwIfRequestCancelled(options);
+    if (this.config.browserFetch) {
+      if (this.config.sessionType === 'stateful') this.browserStatefulRequestSent = true;
+      return sendBrowserRequest(this.config.browserFetch, url, method, headers, body, options);
+    }
     // Forward the caller's W3C trace context to SAP so one trace spans agent → ARC-1 → SAP.
     // Empty unless the MCP client sent a valid `traceparent`; ARC-1 never originates a trace.
     // Injected here because doFetch is the single outbound choke point (the proxy branch below

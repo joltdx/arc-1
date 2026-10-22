@@ -167,9 +167,9 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 
 | Area | Files | Browser replacement |
 | --- | --- | --- |
-| Outgoing HTTP | `src/adt/http.ts` (undici `Agent`/`Client`), `bounded-response.ts` (`node:stream`, undici), `request-attempt-budget.ts` (undici) | `fetchImpl` seam at `doFetch` (`http.ts` ~L1335, the single outbound choke point); no dispatcher/proxy; byte-bounding via WHATWG `ReadableStream` reader |
-| Cookie jar | `http.ts` `cookieJar`, `cookies.ts` (`node:fs`) | `cookieMode: 'browser'`: no jar, no `Cookie` header, no file reload; CSRF logic unchanged |
-| Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | Browser: no jar clone possible; serialize via write queue (`navigator.locks`); close-session behavior must be re-verified (§6 risk 1) |
+| Outgoing HTTP | `src/adt/http.ts` (undici `Agent`/`Client`), `bounded-response.ts` (`node:stream`, undici), `request-attempt-budget.ts` (undici) | **Done (2.5):** `AdtHttpConfig.browserFetch` branch in `sendRequest()` (body in `http-browser.ts`); undici replaced by a throwing bundle-only stand-in. Byte-bounding (`capResponseBody`) was already WHATWG streams; the `node:stream`/undici imports in `bounded-response.ts` are type-only, and the Node-stream code there is the out-of-scope Connectivity proxy |
+| Cookie jar | `http.ts` `cookieJar`, `cookies.ts` (`node:fs`) | **Done (2.5), no separate option needed:** browsers hide `Set-Cookie` from scripts and drop a script-set `Cookie`, so the jar stays empty by itself; `browserFetch` refuses cookie options and strips `Cookie`. `cookies.ts` gets a bundle-only `node:fs` stand-in scoped to that file |
+| Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | **Transport done (2.5):** close is sent without `sap-contextid` whenever the clone sent a stateful request (the jar cannot see the HttpOnly cookie). Write queue (`navigator.locks`) and `pagehide` close remain Phase 5 |
 | Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | `node:async_hooks` stand-in: single-slot `AsyncLocalStorage`, valid because tool calls are serialized |
 | Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | **Done (2.2):** `node:crypto` stand-in, sync pure-JS sha256 (`@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
 | Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | WAF gzip: unsupported in browser (config refuses); stored text: `DecompressionStream` or exclude in v1 |
@@ -178,12 +178,14 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 | Cache | `cache/sqlite.ts`, `cache/sqlite-driver.ts` (`better-sqlite3` or `node:sqlite` via `node:module`, since 1.7.0) | Memory cache only |
 | Server setup | `server/server.ts` `createServer` (express, XSUAA, multi-target, plugins, stdio, `node:http`) | **Do not reuse.** New small `src/browser/` entry composing `AdtClient` + `getToolDefinitions` + `handleToolCall` |
 | Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | `ConsoleSink` + host sinks via `addSink`; memory envelope = fixed config value |
+| Node globals (no import, so no redirect or esbuild error catches them) | `Buffer` (~20 shared uses: `byteLength`, base64/hex, `concat`, stored-text chunks), `process.env` (`http.ts` `ARC1_LOG_HTTP_DEBUG`, server helpers), `process.stderr` (logger, stderr sink) | 2.9. `process.env`: esbuild `define` to `{}` (env config is unset in the browser). `Buffer`: decide between injecting the `buffer` package (faithful port) or a stand-in for the used surface; either way the shimmed test run must use it too. `process.stderr`: 2.8. Tracked per file by the ratchet in `tests/unit/browser/http-bundle.test.ts` |
 | Out of scope | `oauth.ts`, `abapgit.ts` (`node:net`), destinations, multi-target, plugin loader | Not reachable from browser entry; enforced by bundle guard |
 
 ### 4.4 Browser-specific HTTP behavior to handle
 
 - `credentials: 'include'`; never set `Cookie` or `User-Agent` (forbidden or ignored).
-- `redirect: 'manual'` yields an opaque response (status 0) in browsers; adapt the attempt-budget path.
+- `redirect: 'manual'` yields an opaque response (status 0) in browsers; the attempt-budget path treats `opaqueredirect`
+  like a 3xx (done in 2.5).
 - Session expiry: observed on 7.57 as **400 `text/html`** ("Session timed out"), no redirect. Other setups may
   follow a SAML/login redirect and get 200 + HTML. Detect by HTML content type on `/sap/bc/adt` (or
   `response.redirected`); retry once, refresh CSRF, then raise a typed "re-authentication required" error.
@@ -239,15 +241,21 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   §4.2). Checked at `7b210cbf`: in browser scope only `dispatch.ts` and `stored-text/source.ts` call `run()`, and
   the stored-text run is nested and awaited; only three unit tests depend on concurrent tool calls.
   - [ ] Phase 3: `createBrowserServer` must serialize `tools/call` (queue), or the overlap detection fails both calls
-- [ ] 2.5 HTTP: `fetchImpl` + `cookieMode` in `AdtHttpClient` config; bounded response on web streams; manual-redirect handling
-  - Security-session gate (1.7.0, #1043, `security-session-gate.ts`): with no cookie jar, `hasSecuritySessionCookie`
-    is always false, so only the first request runs alone until one succeeds. Unit-test that the gate opens with
-    `cookieMode: 'browser'` and that a 401 reset re-arms it.
-  - Headerless CSRF retry (1.7.0, #1046): see §4.4; unit-test expired-session (400 `text/html`) through that path.
+- [x] 2.5 HTTP: one option, `AdtHttpConfig.browserFetch` (not `fetchImpl` + `cookieMode`: in a browser they always go
+  together). Refuses proxy/TLS/credential/WAF-gzip options; `credentials: 'include'`; no `Cookie`/`User-Agent`;
+  one attempt-budget charge per fetch; opaque manual redirects treated like 3xx (`bounded-response.ts`). Tests:
+  `tests/unit/adt/http-browser.test.ts`; browser bundle of `http.ts` + Node-globals ratchet:
+  `tests/unit/browser/http-bundle.test.ts`. `http.ts` budget +4 (body lives in `http-browser.ts`)
+  - [x] Security-session gate (1.7.0, #1043): with no jar the first cold request goes alone, then the client fans
+    out; a 401 reset re-arms it. Covered in `http-browser.test.ts`.
+  - [x] Headerless CSRF retry (1.7.0, #1046): expired-session baseline (400 `text/html`) locked in: stateless CSRF =
+    HEAD + GET, stateful adds the headerless GET, then a typed 400. Phase 4 turns this into a re-auth error.
   - Phase 4: repeat spike test 9 (log off, then write) through the real ARC-1 code path on 7.57.
 - [ ] 2.6 AFF schema loader seam (fs vs bundled)
 - [ ] 2.7 Lint config / deny-actions accept in-memory config without fs
 - [ ] 2.8 Logger: `ConsoleSink`; no hard dependency on `StderrSink` from shared code
+- [ ] 2.9 Node globals: `process.env` via esbuild `define`; `Buffer` decision (inject `buffer` package vs stand-in), applied
+  to the shimmed test run too; shrink the ratchet in `http-bundle.test.ts` as each lands
 - [ ] Each PR: roadmap check, size-budget check, PR template filled (live SAP testing N/A for pure refactors; state it)
 
 ### Phase 3: Browser entry + bundle

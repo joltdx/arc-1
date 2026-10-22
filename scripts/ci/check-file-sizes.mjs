@@ -85,7 +85,8 @@ const BUDGETS = {
   // Typed attempt accounting, scoped response ownership, and stateful-context teardown must stay at
   // the transport choke point. Relation parsing/traversal and feature algorithms live elsewhere.
   // +3: classify caller cancellation before generic network wrapping (#1045).
-  'src/adt/http.ts': 1554, // Exact-resource negotiated header lookup (#1126).
+  // +4: browserFetch transport branch, guard and stateful close (body lives in http-browser.ts).
+  'src/adt/http.ts': 1565, // Exact-resource negotiated header lookup (#1126).
   // #817: reject absent CTS documents at the existing list/get parser boundary.
   'src/adt/transport.ts': 1477, // Exhaustive lock-holder parsing extracted to transport-locks.ts (#1080).
   // Target-authorization helpers are extracted; retain shared transport renewal and fail-closed
