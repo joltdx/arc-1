@@ -19,6 +19,18 @@ export const NODE_SHIMS = {
   'node:timers/promises': join(shimDir, 'timers-promises.ts'),
 };
 
+/**
+ * Replaced in the browser bundle only, by stand-ins that throw: the code paths that use these modules
+ * are unreachable with `browserFetch` (Node transport, cookie files, WAF gzip), and their unit tests
+ * mock or need the real module. `importers` limits a stand-in to the listed files, so another use of
+ * the module elsewhere still fails the bundle until it gets a real seam.
+ */
+export const BUNDLE_ONLY_SHIMS = {
+  undici: { shim: join(shimDir, 'undici.ts') },
+  'node:fs': { shim: join(shimDir, 'fs.ts'), importers: ['src/adt/cookies.ts'] },
+  'node:zlib': { shim: join(shimDir, 'zlib.ts'), importers: ['src/adt/http-wire-body.ts'] },
+};
+
 /** True when `importer` is shared source whose Node built-ins the browser build replaces. */
 export function shouldRedirect(importer) {
   if (!importer) return false;
@@ -28,13 +40,21 @@ export function shouldRedirect(importer) {
 
 /** esbuild plugin for the browser bundle. */
 export function esbuildNodeShims() {
-  const filter = new RegExp(`^(${Object.keys(NODE_SHIMS).join('|')})$`);
+  const specifiers = [...Object.keys(NODE_SHIMS), ...Object.keys(BUNDLE_ONLY_SHIMS)];
+  const filter = new RegExp(`^(${specifiers.map((s) => s.replace(/[/]/g, '\\/')).join('|')})$`);
+  const scoped = (importers) => (importers ? new Set(importers.map((f) => join(root, f))) : undefined);
+  const bundleOnly = Object.fromEntries(
+    Object.entries(BUNDLE_ONLY_SHIMS).map(([spec, { shim, importers }]) => [spec, { shim, only: scoped(importers) }]),
+  );
   return {
     name: 'arc1-node-shims',
     setup(build) {
-      build.onResolve({ filter }, (args) =>
-        shouldRedirect(args.importer) ? { path: NODE_SHIMS[args.path] } : undefined,
-      );
+      build.onResolve({ filter }, (args) => {
+        if (!shouldRedirect(args.importer)) return undefined;
+        if (NODE_SHIMS[args.path]) return { path: NODE_SHIMS[args.path] };
+        const entry = bundleOnly[args.path];
+        return !entry.only || entry.only.has(resolve(args.importer)) ? { path: entry.shim } : undefined;
+      });
     },
   };
 }

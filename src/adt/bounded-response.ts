@@ -14,7 +14,10 @@ export async function prepareBoundedResponse(
   if (options?.attemptBudget && !options.discardResponseBody && [401, 403].includes(response.status)) {
     options.attemptBudget.authorizationFailureObserved = true;
   }
-  if (options?.attemptBudget && response.status >= 300 && response.status < 400 && response.status !== 304) {
+  // Browsers report a manual redirect as an opaque status-0 response instead of the 3xx.
+  const redirected =
+    response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400 && response.status !== 304);
+  if (options?.attemptBudget && redirected) {
     await response.body?.cancel();
     throw new AdtApiError(
       'Redirects are not allowed during bounded SAP analysis.',
