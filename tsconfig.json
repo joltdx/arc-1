@@ -21,5 +21,6 @@
     "exactOptionalPropertyTypes": false
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "tests"]
+  // src/browser/ is bundled by esbuild for the browser runtime only; never emitted into the npm package.
+  "exclude": ["node_modules", "dist", "tests", "src/browser"]
 }
