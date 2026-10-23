@@ -1,7 +1,7 @@
 import * as nodeCrypto from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { process as browserProcess } from '../../../src/browser/globals.js';
+import { process as browserProcess, consoleMethodFor } from '../../../src/browser/globals.js';
 import { createHash } from '../../../src/browser/node-shims/crypto.js';
 import { readFileSync as shimReadFileSync } from '../../../src/browser/node-shims/fs.js';
 import { isIP } from '../../../src/browser/node-shims/net.js';
@@ -88,10 +88,31 @@ describe('bundle-only stand-ins for unreachable Node paths', () => {
 });
 
 describe('injected process global', () => {
-  it('has empty env and routes stderr to console.error without the trailing newline', () => {
+  it('has empty env and routes stderr to the console method of the line level, without the trailing newline', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(browserProcess.env).toEqual({});
     expect(browserProcess.stderr.write('[ts] WARN: line\n')).toBe(true);
-    expect(error).toHaveBeenCalledWith('[ts] WARN: line');
+    expect(warn).toHaveBeenCalledWith('[ts] WARN: line');
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it('reads the level from text and JSON log lines', () => {
+    expect(consoleMethodFor('[2026-10-23T09:42:30.891Z] DEBUG: [http_request] {}')).toBe('debug');
+    expect(consoleMethodFor('[2026-10-23T09:42:30.891Z] INFO: [tool_call_start] {"tool":"SAPRead"}')).toBe('info');
+    expect(consoleMethodFor('[ts] WARN: x')).toBe('warn');
+    expect(consoleMethodFor('[ts] ERROR: x')).toBe('error');
+    expect(consoleMethodFor('{"timestamp":"t","level":"info","message":"m"}')).toBe('info');
+    expect(consoleMethodFor('{"timestamp":"t","level":"debug","event":"http_request"}')).toBe('debug');
+  });
+
+  it('keeps anything it cannot read on console.error', () => {
+    expect(consoleMethodFor('plain text')).toBe('error');
+    expect(consoleMethodFor('[ts] TRACE: unknown level')).toBe('error');
+    expect(consoleMethodFor('{"level":"verbose"}')).toBe('error');
+    expect(consoleMethodFor('{not json')).toBe('error');
+    // A nested "level" (e.g. in tool arguments) is not the line's level.
+    expect(consoleMethodFor('{"message":"m","args":{"level":"debug"}}')).toBe('error');
+    expect(consoleMethodFor('[ts] INFO: message mentioning "level":"debug"')).toBe('info');
   });
 });
