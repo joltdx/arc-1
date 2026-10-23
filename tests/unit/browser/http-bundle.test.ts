@@ -58,7 +58,7 @@ type Bundle = {
 
 let bundle: Bundle;
 let context: vm.Context;
-const consoleErrors: string[] = [];
+const consoleWarnings: string[] = [];
 
 beforeAll(async () => {
   const result = await build({
@@ -71,7 +71,7 @@ beforeAll(async () => {
     logLevel: 'silent',
   });
   const sandbox: Record<string, unknown> = {
-    console: { ...console, error: (...args: unknown[]) => consoleErrors.push(args.join(' ')) },
+    console: { ...console, warn: (...args: unknown[]) => consoleWarnings.push(args.join(' ')) },
   };
   for (const name of WEB_GLOBALS) sandbox[name] = globalThis[name];
   context = vm.createContext(sandbox);
@@ -109,10 +109,10 @@ describe('browser bundle in a context without Node globals', () => {
     expect(requests.map((r) => r.init.method)).toEqual(['GET', 'HEAD', 'POST']);
     expect(requests.every((r) => r.init.credentials === 'include')).toBe(true);
     expect((requests[2].init.headers as Record<string, string>)['X-CSRF-Token']).toBe('TOKEN');
-    // The failed POST is logged at warn level through the injected process.stderr → console.error.
-    expect(consoleErrors.some((line) => line.includes('WARN') && line.includes('/sap/bc/adt/programs/programs'))).toBe(
-      true,
-    );
+    // The failed POST is logged at warn level through the injected process.stderr → console.warn.
+    expect(
+      consoleWarnings.some((line) => line.includes('WARN') && line.includes('/sap/bc/adt/programs/programs')),
+    ).toBe(true);
   });
 
   it('runs shared Buffer code on the injected buffer package', () => {
