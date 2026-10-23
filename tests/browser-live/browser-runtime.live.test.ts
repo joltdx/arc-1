@@ -21,9 +21,13 @@
  * A second block starts the runtime as an embedding page does, through the host helper (`host.js`), with the
  * bundle served from another origin (a second dev server), so the helper's blob bootstrap runs for real.
  *
- * Read-only: no object is created or changed.
+ * A last block writes (Phase 5): it creates, changes, activates and deletes a program and a class in `$TMP`
+ * through the host helper, with each write approved on the page, and checks the cross-tab write queue, a lock held
+ * by another session, and the `pagehide` close when a tab closes in the middle of a write. Nothing else is changed;
+ * the objects are deleted at the end (best effort through Node ARC-1 if a test failed).
  */
 import { mkdtempSync, rmSync } from 'node:fs';
+import type { IncomingMessage } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -35,6 +39,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserBundleOptions, browserHostOptions } from '../../scripts/browser/build.mjs';
 import { startDevServer } from '../../scripts/browser/dev-server.mjs';
 import { defaultFeatureConfig } from '../../src/adt/config.js';
+import { lockObject, unlockObject } from '../../src/adt/crud.js';
 import { probeFeatures } from '../../src/adt/features.js';
 import { resolveBrowserConfig } from '../../src/browser/config.js';
 import { handleToolCall } from '../../src/handlers/dispatch.js';
@@ -64,11 +69,14 @@ interface HarnessPage {
     hostCall(name: string, args: unknown, options?: unknown): Promise<{ content: unknown; isError?: boolean }>;
     audit: AuditRecord[];
     toolsChanged: number;
+    approve: boolean | 'confirm';
+    approvals: Array<{ tool: string; action?: string; scope: string; args: Record<string, unknown> }>;
   };
 }
 
 interface SeenRequest {
   url: string;
+  method: string;
   sessionType?: string;
 }
 
@@ -107,6 +115,8 @@ let devServer: { url: string; close(): Promise<void> };
 /** Serves the same bundle on another origin, as the host's own web server would. */
 let bundleServer: { url: string; close(): Promise<void> };
 let browser: Browser;
+/** Lets a test hold a proxied SAP request (Playwright cannot intercept a dedicated worker's requests). */
+let holdRequest: ((req: IncomingMessage) => Promise<void> | undefined) | undefined;
 
 async function openSession(withLogon: boolean): Promise<Session> {
   const { context, page, requests } = await openPage(withLogon);
@@ -137,7 +147,11 @@ async function openPage(withLogon: boolean) {
   const requests: SeenRequest[] = [];
   context.on('request', (request) => {
     if (new URL(request.url()).pathname.startsWith('/sap/')) {
-      requests.push({ url: request.url(), sessionType: request.headers()['x-sap-adt-sessiontype'] });
+      requests.push({
+        url: request.url(),
+        method: request.method(),
+        sessionType: request.headers()['x-sap-adt-sessiontype'],
+      });
     }
   });
   if (withLogon) {
@@ -185,7 +199,12 @@ beforeAll(async () => {
   outdir = mkdtempSync(join(tmpdir(), 'arc1-browser-live-'));
   await build({ ...browserBundleOptions({ outdir }), legalComments: 'none', logLevel: 'silent' });
   await build({ ...browserHostOptions({ outdir }), logLevel: 'silent' });
-  devServer = await startDevServer({ target: SAP_URL, bundleDir: outdir, insecure: INSECURE });
+  devServer = await startDevServer({
+    target: SAP_URL,
+    bundleDir: outdir,
+    insecure: INSECURE,
+    holdRequest: (req) => holdRequest?.(req),
+  });
   bundleServer = await startDevServer({ target: SAP_URL, bundleDir: outdir, insecure: INSECURE });
   // Node probes too, so both sides answer from the same feature set.
   cacheProbedFeatures(await probeFeatures(nodeClient.http, defaultFeatureConfig(), nodeConfig.systemType), false);
@@ -385,5 +404,260 @@ describe('browser runtime without an SAP logon', () => {
     expect(result.isError).toBe(true);
     expect(text(result)).toContain('no longer logged on to SAP in this browser');
     expect(text(result)).toContain('log on to SAP again in this browser');
+  });
+});
+
+describe('writes on $TMP through the host helper', () => {
+  const suffix = Math.random().toString(36).slice(2, 8).toUpperCase();
+  const PROG = `ZARC1B_${suffix}`;
+  const CLAS = `ZCL_ARC1B_${suffix}`;
+  const PROG_URL = `/sap/bc/adt/programs/programs/${PROG.toLowerCase()}`;
+  const writeConfig = { client: SAP_CLIENT, allowWrites: true };
+  const nodeWriteConfig = resolveBrowserConfig(writeConfig, SAP_USER);
+  const classSource = (body: string) =>
+    `CLASS ${CLAS.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n  PUBLIC SECTION.\n` +
+    `    METHODS run RETURNING VALUE(result) TYPE string.\nENDCLASS.\n\n` +
+    `CLASS ${CLAS.toLowerCase()} IMPLEMENTATION.\n  METHOD run.\n    ${body}\n  ENDMETHOD.\nENDCLASS.\n`;
+  const pages: Array<Awaited<ReturnType<typeof openPage>>> = [];
+
+  /** A logged-on page whose runtime (host helper, same origin) may write; approval answers `true` by default. */
+  async function openWriter(context?: BrowserContext) {
+    let opened: Awaited<ReturnType<typeof openPage>>;
+    if (context) {
+      const page = await context.newPage();
+      await page.goto(devServer.url);
+      opened = { context, page, requests: pages[0]!.requests };
+    } else {
+      opened = await openPage(true);
+    }
+    pages.push(opened);
+    await opened.page.evaluate((options) => (globalThis as unknown as HarnessPage).arc1Harness.startHost({ options }), {
+      config: writeConfig,
+      user: SAP_USER,
+    });
+    return opened;
+  }
+
+  async function call(page: Page, name: string, args: Record<string, unknown>) {
+    const started = Date.now();
+    const result = await page.evaluate(([n, a]) => (globalThis as unknown as HarnessPage).arc1Harness.hostCall(n, a), [
+      name,
+      args,
+    ] as const);
+    return { isError: Boolean(result.isError), body: text(result), ms: Date.now() - started };
+  }
+
+  async function ok(page: Page, name: string, args: Record<string, unknown>) {
+    const result = await call(page, name, args);
+    expect(result.isError, `${name} ${JSON.stringify(args).slice(0, 200)} failed:\n${result.body}`).toBe(false);
+    console.log(`    ${name} ${String(args.action ?? args.type ?? '')}: ${result.ms} ms`);
+    return result;
+  }
+
+  /** Whether SAP lets another session lock the program (Node ARC-1, its own session). */
+  async function nodeCanLock(): Promise<boolean> {
+    try {
+      await nodeClient.http.withStatefulSession(async (session) => {
+        const lock = await lockObject(session, nodeClient.safety, PROG_URL);
+        await unlockObject(session, PROG_URL, lock.lockHandle);
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  let writer: Awaited<ReturnType<typeof openPage>>;
+
+  beforeAll(async () => {
+    writer = await openWriter();
+  });
+
+  afterAll(async () => {
+    for (const opened of new Set(pages.map((p) => p.context))) await opened.close().catch(() => undefined);
+    for (const [type, name] of [
+      ['PROG', PROG],
+      ['CLAS', CLAS],
+    ]) {
+      // best-effort-cleanup: the delete test removes both; this only catches a failed run.
+      await handleToolCall(nodeClient, nodeWriteConfig, 'SAPWrite', { action: 'delete', type, name }).catch(
+        () => undefined,
+      );
+    }
+  });
+
+  it('creates and changes a program after the page approves each write', async () => {
+    await ok(writer.page, 'SAPWrite', {
+      action: 'create',
+      type: 'PROG',
+      name: PROG,
+      package: '$TMP',
+      description: 'ARC-1 browser runtime live test',
+      source: `REPORT ${PROG.toLowerCase()}.\nWRITE 'created'.`,
+    });
+    await ok(writer.page, 'SAPWrite', {
+      action: 'update',
+      type: 'PROG',
+      name: PROG,
+      source: `REPORT ${PROG.toLowerCase()}.\nWRITE 'updated'.`,
+    });
+    await ok(writer.page, 'SAPActivate', { type: 'PROG', name: PROG });
+    expect((await ok(writer.page, 'SAPRead', { type: 'PROG', name: PROG })).body).toContain("WRITE 'updated'.");
+
+    const approvals = await writer.page.evaluate(() => (globalThis as unknown as HarnessPage).arc1Harness.approvals);
+    expect(approvals.map((a) => `${a.tool}.${a.action ?? ''}`)).toEqual([
+      'SAPWrite.create',
+      'SAPWrite.update',
+      'SAPActivate.',
+    ]);
+    expect(approvals[1]).toMatchObject({ scope: 'write', args: { type: 'PROG', name: PROG } });
+  });
+
+  it('sends nothing when the page refuses', async () => {
+    await writer.page.evaluate(() => {
+      (globalThis as unknown as HarnessPage).arc1Harness.approve = false;
+    });
+    const before = writer.requests.length;
+    const refused = await call(writer.page, 'SAPWrite', {
+      action: 'update',
+      type: 'PROG',
+      name: PROG,
+      source: `REPORT ${PROG.toLowerCase()}.\nWRITE 'refused'.`,
+    });
+    await writer.page.evaluate(() => {
+      (globalThis as unknown as HarnessPage).arc1Harness.approve = true;
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.body).toContain('the user did not approve it');
+    expect(writer.requests.length).toBe(before);
+  });
+
+  it('creates a class, edits one method and activates it, with lint before each write', async () => {
+    await ok(writer.page, 'SAPWrite', {
+      action: 'create',
+      type: 'CLAS',
+      name: CLAS,
+      package: '$TMP',
+      description: 'ARC-1 browser runtime live test',
+      source: classSource("result = 'created'."),
+    });
+    await ok(writer.page, 'SAPWrite', {
+      action: 'edit_method',
+      type: 'CLAS',
+      name: CLAS,
+      method: 'run',
+      source: "  METHOD run.\n    result = 'edited'.\n  ENDMETHOD.",
+    });
+    await ok(writer.page, 'SAPActivate', { type: 'CLAS', name: CLAS });
+    expect((await ok(writer.page, 'SAPRead', { type: 'CLAS', name: CLAS })).body).toContain("result = 'edited'.");
+
+    // abaplint in the worker, on its own: the share of each write above that lint-before-write takes.
+    const lint = [];
+    for (let i = 0; i < 3; i++) {
+      lint.push((await ok(writer.page, 'SAPLint', { action: 'lint', source: classSource("result = 'x'.") })).ms);
+    }
+    console.log(`    SAPLint lint in the worker: ${lint.join(', ')} ms`);
+  });
+
+  it('fails cleanly, without waiting, while another session holds the lock', async () => {
+    await nodeClient.http.withStatefulSession(async (session) => {
+      const lock = await lockObject(session, nodeClient.safety, PROG_URL);
+      try {
+        const blocked = await call(writer.page, 'SAPWrite', {
+          action: 'update',
+          type: 'PROG',
+          name: PROG,
+          source: `REPORT ${PROG.toLowerCase()}.\nWRITE 'blocked'.`,
+        });
+        expect(blocked.isError).toBe(true);
+        expect(blocked.body).toMatch(/lock|enqueue|currently editing/i);
+        console.log(`    update while Node holds the lock: refused in ${blocked.ms} ms`);
+      } finally {
+        await unlockObject(session, PROG_URL, lock.lockHandle);
+      }
+    });
+    expect(await nodeCanLock()).toBe(true);
+  });
+
+  it("queues writes from two tabs, so one tab never closes the other one's session", async () => {
+    const second = await openWriter(writer.context);
+    const start = writer.requests.length;
+    const update = (page: Page, word: string) =>
+      call(page, 'SAPWrite', {
+        action: 'update',
+        type: 'PROG',
+        name: PROG,
+        source: `REPORT ${PROG.toLowerCase()}.\nWRITE '${word}'.`,
+      });
+
+    const results = await Promise.all([update(writer.page, 'tab1'), update(second.page, 'tab2')]);
+
+    for (const result of results) expect(result.isError, result.body).toBe(false);
+    // Each lock is followed by its own close before the next lock: the sessions did not overlap.
+    const sequence = writer.requests
+      .slice(start)
+      .map((r) => (r.url.includes('_action=LOCK') ? 'lock' : r.url.includes('/core/http/sessions') ? 'close' : ''))
+      .filter(Boolean);
+    expect(sequence).toEqual(['lock', 'close', 'lock', 'close']);
+    await second.page.close();
+  });
+
+  it('releases the lock at once when the tab closes in the middle of a write', async () => {
+    const tab = await openWriter(writer.context);
+    let putSeen!: () => void;
+    const putReached = new Promise<void>((resolve) => {
+      putSeen = resolve;
+    });
+    let dropPut!: () => void;
+    // Hold the PUT at the proxy: SAP has the lock, the stateful session is open, the change never arrives.
+    // The proxy sees the close too: Playwright stops reporting a page's requests once the page is closed.
+    const proxiedCloses: string[] = [];
+    holdRequest = (req) => {
+      if (req.headers['x-sap-adt-sessiontype'] === 'stateless')
+        proxiedCloses.push(`${req.method} ${req.url?.split('?')[0]}`);
+      if (req.method !== 'PUT' || !req.url?.toLowerCase().startsWith(`${PROG_URL}/source/main`)) return undefined;
+      putSeen();
+      return new Promise<void>((_resolve, reject) => {
+        dropPut = () => reject(new Error('dropped by the test'));
+      });
+    };
+    const pending = call(tab.page, 'SAPWrite', {
+      action: 'update',
+      type: 'PROG',
+      name: PROG,
+      source: `REPORT ${PROG.toLowerCase()}.\nWRITE 'never'.`,
+    }).catch(() => undefined);
+    await putReached;
+    expect(await nodeCanLock()).toBe(false);
+
+    try {
+      await tab.page.close({ runBeforeUnload: true });
+      // Sent in parallel, so in either order. The discovery request ends the context where the close resource is
+      // missing: a stateless 404 leaves it open (7.31 + abapfs_extensions).
+      await expect
+        .poll(() => [...proxiedCloses].sort(), { timeout: 5_000 })
+        .toEqual(['GET /sap/bc/adt/core/http/sessions', 'HEAD /sap/bc/adt/discovery']);
+    } finally {
+      holdRequest = undefined;
+      dropPut();
+      await pending;
+    }
+
+    await expect.poll(nodeCanLock, { timeout: 10_000 }).toBe(true);
+    expect((await ok(writer.page, 'SAPRead', { type: 'PROG', name: PROG })).body).not.toContain('never');
+  });
+
+  it('sends no stateless request but the close', () => {
+    // The runtime's close: the close resource, then (where it is 404) the 7.50 fallback; the page adds discovery.
+    const closePaths = ['/sap/bc/adt/core/http/sessions', '/sap/bc/adt/core/discovery', '/sap/bc/adt/discovery'];
+    for (const request of writer.requests.filter((r) => r.sessionType === 'stateless')) {
+      expect(closePaths).toContain(new URL(request.url).pathname);
+    }
+  });
+
+  it('deletes both objects', async () => {
+    await ok(writer.page, 'SAPWrite', { action: 'delete', type: 'PROG', name: PROG });
+    await ok(writer.page, 'SAPWrite', { action: 'delete', type: 'CLAS', name: CLAS });
+    expect((await call(writer.page, 'SAPRead', { type: 'PROG', name: PROG })).isError).toBe(true);
   });
 });
