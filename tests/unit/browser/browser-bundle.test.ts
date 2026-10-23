@@ -46,7 +46,7 @@ for (const name of ${JSON.stringify(DELETED_GLOBALS)}) delete globalThis[name];
       ? new Response('REPORT zhello.', { status: 200, headers: { 'content-type': 'text/plain' } })
       : new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } });
   };
-  console.error = () => undefined;
+  for (const method of ['debug', 'info', 'warn', 'error']) console[method] = () => undefined;
   const server = runtime.createBrowserServer({ baseUrl: 'https://sap.example.com', fetch: fakeSap, user: 'developer' });
   await server.connect(new runtime.MessagePortTransport(workerData.port));
   report({ ready: true, apiVersion: runtime.BROWSER_API_VERSION });
