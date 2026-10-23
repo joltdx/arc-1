@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * Build the browser runtime bundle (`arc-1/browser`): src/browser/index.ts → dist/browser/index.js plus
- * chunks/, ESM for a module Web Worker. See docs/plans/2026-10-20-browser-embedded-runtime.md.
+ * Build the browser runtime bundle (`arc-1/browser`), ESM, into dist/browser/. See
+ * docs/plans/2026-10-20-browser-embedded-runtime.md.
+ *
+ * - index.js + worker.js (+ shared chunks/): the runtime, and the standard module Web Worker entry.
+ * - host.js: the page-side helper, a separate single-file build with no dependencies.
  *
  * - `splitting`: without it, esbuild evaluates the targets of dynamic `import()` lazily, and the zod
  *   modules they reach are then never initialized for the MCP SDK, which imports zod through `export *`
@@ -25,7 +28,7 @@ export function browserBundleOptions({ outdir = join(root, 'dist', 'browser'), m
   return {
     ...browserBuildOptions(),
     absWorkingDir: root,
-    entryPoints: { index: 'src/browser/index.ts' },
+    entryPoints: { index: 'src/browser/index.ts', worker: 'src/browser/worker.ts' },
     outdir,
     bundle: true,
     format: 'esm',
@@ -37,6 +40,26 @@ export function browserBundleOptions({ outdir = join(root, 'dist', 'browser'), m
     sourcemap,
     metafile: true,
     legalComments: 'linked',
+    logLevel: 'warning',
+  };
+}
+
+/**
+ * esbuild options for the page-side helper: one small file, never part of the runtime's chunk graph.
+ * @returns {import('esbuild').BuildOptions & { outdir: string }}
+ */
+export function browserHostOptions({ outdir = join(root, 'dist', 'browser'), minify = true, sourcemap = false } = {}) {
+  return {
+    absWorkingDir: root,
+    entryPoints: { host: 'src/browser/host.ts' },
+    outdir,
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2022',
+    minify,
+    sourcemap,
+    metafile: true,
     logLevel: 'warning',
   };
 }
@@ -62,7 +85,11 @@ async function main() {
     sourcemap: values.sourcemap,
   });
   const result = await build(options);
-  console.log(`${options.outdir}: ${(bundleBytes(result.metafile) / 1024).toFixed(0)} KiB of JavaScript`);
+  const host = await build(browserHostOptions({ outdir: options.outdir, minify: options.minify, sourcemap: options.sourcemap }));
+  console.log(
+    `${options.outdir}: ${(bundleBytes(result.metafile) / 1024).toFixed(0)} KiB runtime, ` +
+      `${(bundleBytes(host.metafile) / 1024).toFixed(1)} KiB host.js`,
+  );
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {

@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { build } from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { browserBundleOptions } from '../../../scripts/browser/build.mjs';
-import { checkBundle, FORBIDDEN_PACKAGES } from '../../../scripts/ci/check-browser-bundle.mjs';
+import { checkBundle, checkHost, FORBIDDEN_PACKAGES } from '../../../scripts/ci/check-browser-bundle.mjs';
 import { MessagePortTransport } from '../../../src/browser/message-port-transport.js';
 
 /**
@@ -153,6 +153,20 @@ describe('check-browser-bundle', () => {
     ]);
     expect(checkBundle(metafile([]), 50, 100)).toEqual([
       'bundle is 50 bytes, under 90% of the 100-byte budget: lower BUDGET_BYTES',
+    ]);
+  });
+
+  it('allows only project source in host.js, within its budget', () => {
+    expect(checkHost(metafile(['src/browser/host.ts']), 95, 100)).toEqual([]);
+    expect(
+      checkHost(metafile(['src/browser/host.ts', 'node_modules/zod/index.js'], [{ path: './chunks/a.js' }]), 101, 100),
+    ).toEqual([
+      'host.js bundles package code: zod',
+      "out/index.js keeps an import of './chunks/a.js'",
+      'host.js is 101 bytes, over the 100-byte budget',
+    ]);
+    expect(checkHost(metafile([]), 50, 100)).toEqual([
+      'host.js is 50 bytes, under 90% of the 100-byte budget: lower HOST_BUDGET_BYTES',
     ]);
   });
 });
