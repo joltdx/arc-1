@@ -157,7 +157,11 @@ export interface AdtHttpConfig {
   semaphore?: Semaphore;
   /** Browser runtime: same-origin fetch on the user's SAP session instead of undici (see http-browser.ts). */
   browserFetch?: typeof fetch;
+  /** Browser runtime: wraps each stateful session, first request through close (cross-tab write queue). */
+  statefulWindow?: <T>(run: () => Promise<T>) => Promise<T>;
 }
+
+type StatefulCleanup = { timeoutMs: number; noReplay: boolean; onClose: (closed: boolean | undefined) => void };
 
 /** Response from an ADT HTTP request */
 export interface AdtResponse {
@@ -290,10 +294,12 @@ export class AdtHttpClient {
    * Creates a new client instance with the stateful session header,
    * shares the main client's request state, and closes the backend context.
    */
-  async withStatefulSession<T>(
-    fn: (client: AdtHttpClient) => Promise<T>,
-    cleanup?: { timeoutMs: number; noReplay: boolean; onClose: (closed: boolean | undefined) => void },
-  ): Promise<T> {
+  async withStatefulSession<T>(fn: (client: AdtHttpClient) => Promise<T>, cleanup?: StatefulCleanup): Promise<T> {
+    const run = () => this.runStatefulSession(fn, cleanup);
+    return this.config.statefulWindow ? this.config.statefulWindow(run) : run();
+  }
+
+  private async runStatefulSession<T>(fn: (client: AdtHttpClient) => Promise<T>, cleanup?: StatefulCleanup) {
     const sessionConfig: AdtHttpConfig = {
       ...this.config,
       sessionType: 'stateful',

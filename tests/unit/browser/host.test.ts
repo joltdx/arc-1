@@ -423,3 +423,185 @@ describe('capResultText', () => {
     expect(capped.content[3]).toMatchObject({ type: 'text', text: expect.stringMatching(/cut to 6 of 10 characters/) });
   });
 });
+
+describe('browser runtime host helper: writes', () => {
+  const OBJECT = '/sap/bc/adt/programs/programs/ZHELLO';
+  const UPDATE = { action: 'update', type: 'PROG', name: 'ZHELLO', source: "REPORT zhello.\nWRITE 'bye'." };
+  let runtime: BrowserRuntime | undefined;
+  let page: EventTarget;
+  let pageFetch: ReturnType<typeof vi.fn<typeof fetch>>;
+
+  /** SAP for one $TMP program; the PUT waits for `putGate` when given. */
+  function writableSap(putGate?: Promise<void>) {
+    const writeRoute: Route = async (url, init) => {
+      const method = init.method ?? 'GET';
+      const headers = init.headers as Record<string, string>;
+      if (headers['X-CSRF-Token'] === 'fetch') return mockResponse(200, '', { 'x-csrf-token': 'T' });
+      if (url.pathname === OBJECT && method === 'GET') {
+        return mockResponse(
+          200,
+          '<program:abapProgram xmlns:program="http://www.sap.com/adt/programs/programs" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZHELLO"><adtcore:packageRef adtcore:name="$TMP"/></program:abapProgram>',
+          { 'content-type': 'application/vnd.sap.adt.programs.programs.v2+xml' },
+        );
+      }
+      if (url.searchParams.get('_action') === 'LOCK') {
+        return mockResponse(
+          200,
+          '<asx:abap xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><LOCK_HANDLE>H1</LOCK_HANDLE><CORRNR></CORRNR><IS_LOCAL>X</IS_LOCAL></DATA></asx:values></asx:abap>',
+          { 'content-type': 'application/vnd.sap.as+xml' },
+        );
+      }
+      if (method === 'PUT') {
+        await putGate;
+        return mockResponse(200, '');
+      }
+      if (url.searchParams.get('_action') === 'UNLOCK' || url.pathname.endsWith('/core/http/sessions')) {
+        return mockResponse(200, '');
+      }
+      return undefined;
+    };
+    return routedFetch(writeRoute, programRoute);
+  }
+
+  // The page's fetch is used only for the session close.
+  const closeRequests = () => pageFetch.mock.calls;
+
+  beforeEach(() => {
+    resetCachedFeatures();
+    page = new EventTarget();
+    pageFetch = vi.fn<typeof fetch>(async () => mockResponse(200, ''));
+    vi.stubGlobal('addEventListener', page.addEventListener.bind(page));
+    vi.stubGlobal('removeEventListener', page.removeEventListener.bind(page));
+    vi.stubGlobal('fetch', pageFetch);
+  });
+
+  afterEach(() => {
+    runtime?.close();
+    runtime = undefined;
+    vi.unstubAllGlobals();
+  });
+
+  it('asks the page to approve each write and refuses without its yes', async () => {
+    const calls: unknown[] = [];
+    const answers = [false, true];
+    const worker = runtimeWorker({ fetch: writableSap() });
+    runtime = await connectBrowserRuntime(worker, {
+      options: { baseUrl: BASE_URL, config: { allowWrites: true } },
+      approveWrite: (call) => {
+        calls.push(call);
+        return answers.shift() as boolean;
+      },
+    });
+
+    const refused = await runtime.callTool('SAPWrite', UPDATE);
+    const approved = await runtime.callTool('SAPWrite', UPDATE);
+
+    expect(text(refused)).toMatch(/did not approve/);
+    expect(approved.isError, text(approved)).toBeFalsy();
+    expect(calls).toEqual([
+      { tool: 'SAPWrite', action: 'update', scope: 'write', args: UPDATE },
+      { tool: 'SAPWrite', action: 'update', scope: 'write', args: UPDATE },
+    ]);
+  });
+
+  it('fails the start when writes are allowed without an approval hook', async () => {
+    const worker = runtimeWorker({ fetch: routedFetch() });
+    await expect(
+      connectBrowserRuntime(worker, { options: { baseUrl: BASE_URL, config: { allowWrites: true } } }),
+    ).rejects.toThrow(/approveWrite/);
+  });
+
+  it('asks the page whether its audit store can record', async () => {
+    let ready = false;
+    const worker = runtimeWorker({ fetch: writableSap() });
+    runtime = await connectBrowserRuntime(worker, {
+      options: { baseUrl: BASE_URL, config: { allowWrites: true }, auditRequiredForWrites: true },
+      approveWrite: () => true,
+      auditReady: () => ready,
+    });
+
+    expect(text(await runtime.callTool('SAPWrite', UPDATE))).toMatch(/audit store cannot record/);
+    ready = true;
+    expect((await runtime.callTool('SAPWrite', UPDATE)).isError).toBeFalsy();
+  });
+
+  it('aborts the page dialog when the call is cancelled', async () => {
+    let dialog: AbortSignal | undefined;
+    const worker = runtimeWorker({ fetch: writableSap() });
+    runtime = await connectBrowserRuntime(worker, {
+      options: { baseUrl: BASE_URL, config: { allowWrites: true } },
+      approveWrite: (_call, { signal }) => {
+        dialog = signal;
+        return new Promise<boolean>(() => undefined);
+      },
+    });
+    const controller = new AbortController();
+
+    const call = runtime.callTool('SAPWrite', UPDATE, { signal: controller.signal });
+    await vi.waitFor(() => expect(dialog).toBeDefined());
+    controller.abort();
+
+    await expect(call).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(dialog?.aborted).toBe(true));
+  });
+
+  it('closes an open stateful session on pagehide with a keepalive request, and only then', async () => {
+    let release!: () => void;
+    const putGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sap = writableSap(putGate);
+    const worker = runtimeWorker({ fetch: sap });
+    runtime = await connectBrowserRuntime(worker, {
+      options: { baseUrl: BASE_URL, config: { allowWrites: true, client: '200' } },
+      approveWrite: () => true,
+    });
+
+    page.dispatchEvent(new Event('pagehide'));
+    expect(closeRequests()).toEqual([]);
+
+    const call = runtime.callTool('SAPWrite', UPDATE);
+    await vi.waitFor(() => expect(sap.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true));
+    // The worker's session message may reach the page after the PUT starts; pagehide closes once it has.
+    await vi.waitFor(() => {
+      page.dispatchEvent(new Event('pagehide'));
+      expect(closeRequests()).toHaveLength(2);
+    });
+    page.dispatchEvent(new Event('pagehide'));
+
+    const init = (method: string) => ({
+      method,
+      credentials: 'include',
+      keepalive: true,
+      headers: { Accept: '*/*', 'sap-adt-purpose': 'close-session', 'X-sap-adt-sessiontype': 'stateless' },
+    });
+    // The discovery request closes where the close resource is missing (a 404 leaves the context open on 7.31).
+    expect(closeRequests()).toEqual([
+      [`${BASE_URL}/sap/bc/adt/core/http/sessions?sap-client=200`, init('GET')],
+      [`${BASE_URL}/sap/bc/adt/discovery?sap-client=200`, init('HEAD')],
+    ]);
+    release();
+    await call;
+    page.dispatchEvent(new Event('pagehide'));
+    expect(closeRequests()).toHaveLength(2);
+  });
+
+  it('closes an open stateful session when the host stops the runtime', async () => {
+    const sap = writableSap(new Promise<void>(() => undefined));
+    const worker = runtimeWorker({ fetch: sap });
+    runtime = await connectBrowserRuntime(worker, {
+      options: { baseUrl: BASE_URL, config: { allowWrites: true } },
+      approveWrite: () => true,
+    });
+
+    const call = runtime.callTool('SAPWrite', UPDATE);
+    await vi.waitFor(() => expect(sap.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true));
+    runtime.close();
+
+    await expect(call).rejects.toThrow(/closed/);
+    expect(closeRequests().map(([url]) => url)).toEqual([
+      `${BASE_URL}/sap/bc/adt/core/http/sessions`,
+      `${BASE_URL}/sap/bc/adt/discovery`,
+    ]);
+  });
+});

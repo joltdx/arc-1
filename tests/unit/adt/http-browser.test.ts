@@ -179,6 +179,35 @@ describe('AdtHttpClient browserFetch transport', () => {
       ).rejects.toThrow('validation failed');
       expect(browserFetch).not.toHaveBeenCalled();
     });
+
+    it('runs the whole session, close included, inside statefulWindow', async () => {
+      const log: string[] = [];
+      browserFetch.mockImplementation(async (url) => {
+        log.push(new URL(String(url)).pathname);
+        return mockResponse(200, '', { 'x-csrf-token': 'T' });
+      });
+      const statefulWindow = async <T>(run: () => Promise<T>): Promise<T> => {
+        log.push('enter');
+        try {
+          return await run();
+        } finally {
+          log.push('leave');
+        }
+      };
+      const client = new AdtHttpClient({ ...config, statefulWindow });
+
+      const result = await client.withStatefulSession(async (session) => {
+        await session.post('/sap/bc/adt/programs/programs/Z', undefined, undefined, undefined);
+        return 'done';
+      });
+
+      expect(result).toBe('done');
+      expect(log[0]).toBe('enter');
+      expect(log.slice(-2)).toEqual([closePath, 'leave']);
+      // Reads outside a session do not enter the window.
+      await client.get('/sap/bc/adt/programs/programs/Z');
+      expect(log.at(-1)).toBe('/sap/bc/adt/programs/programs/Z');
+    });
   });
 
   describe('session end (spike test 9: 400 text/html after logoff)', () => {
