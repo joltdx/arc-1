@@ -187,7 +187,7 @@ describe('createBrowserServer', () => {
     await client?.close();
     await runtime?.close();
 
-    const writable = await connect({ fetch: routedFetch(), config: { allowWrites: true } });
+    const writable = await connect({ fetch: routedFetch(), config: { allowWrites: true }, approveWrite: () => true });
     expect((await writable.client.listTools()).tools.map((tool) => tool.name)).toContain('SAPWrite');
   });
 

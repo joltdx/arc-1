@@ -66,8 +66,11 @@ app by cookie path, and browser writes work, under the constraints listed in "Im
   request ends the context even when the resource is 404. The spike sends three close requests in a row (two as in
   ARC-1, plus the extra legacy HEAD), so this run does not isolate which one ended the context. 7.57's test 4b
   shows any stateless ADT request suffices, so the first (ARC-1's) most likely did.
-  - Possible upstream note: Node ARC-1's `closeStatefulSession()` probably logs a "Failed to close" warning on
-    these systems even though the context closed (not verified with Node).
+  - **Corrected 2026-10-23** ([live write test](2026-10-23-browser-runtime-live-write.md#results-system-a-731)): it was the
+    third one. On 7.31 a stateless request to a 404 path (`/core/http/sessions`, `/core/discovery`) leaves the
+    context and its locks in place; a stateless request to an existing resource (`HEAD` or `GET
+    /sap/bc/adt/discovery`) ends it and releases the locks at once. So ARC-1's own close does not end the context
+    on these systems (Node and browser alike); its UNLOCK still releases the lock.
 - `sap-contextid`: path `/sap/bc/adt`, **not HttpOnly** (7.57: HttpOnly). It is still invisible to a host page
   outside `/sap/bc/adt` (`document.cookie` only lists cookies whose path covers the page), so the runtime must
   not depend on reading it either way.

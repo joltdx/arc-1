@@ -109,7 +109,7 @@ ai client (browser page on the ABAP origin)
 
 ### 4.1 Public contract (`@experimental`, like `arc-1/public`)
 
-As built in Phase 3 (`src/browser/index.ts`, `config.ts`, `message-port-transport.ts`); Phase 5 adds the write options.
+As built in Phase 3 (`src/browser/index.ts`, `config.ts`, `message-port-transport.ts`) and Phase 5 (`write-gate.ts`).
 
 ```ts
 export const BROWSER_API_VERSION = 1;
@@ -119,8 +119,12 @@ export interface BrowserServerOptions {
   config?: Partial<BrowserServerConfig>; // host settings; unknown or unsupported keys throw
   user?: string;                 // host-supplied SAP user (decided 2026-10-22), see below
   sinks?: LogSink[];             // audit sinks in addition to the console
-  // Phase 5: auditRequiredForWrites?: boolean; approveWrite?: (call) => Promise<boolean>;
+  approveWrite?(call: WriteCall, { signal }): boolean | Promise<boolean>; // required with allowWrites
+  auditRequiredForWrites?: boolean; auditReady?(): boolean | Promise<boolean>; // the second requires the first
+  onStatefulSessionChange?(open: boolean): void; // the page closes an open session on pagehide
+  locks?: LockManagerLike | null;                // cross-tab queue; default navigator.locks
 }
+interface WriteCall { tool; action?; scope: 'write' | 'transports' | 'git'; args } // hyperfocused: the mapped tool
 export function createBrowserServer(options?: BrowserServerOptions): {
   server: Server; config: Readonly<ServerConfig>;
   connect(transport: Transport): Promise<void>; // then probes features, then tools/list_changed
@@ -128,14 +132,15 @@ export function createBrowserServer(options?: BrowserServerOptions): {
 };
 export { MessagePortTransport, type MessagePortLike }; // Worker, MessagePort or the worker's own scope
 
-// dist/browser/worker.js: serveBrowserRuntime(self); hosts that need fetch or in-worker sinks call it themselves.
-export function serveBrowserRuntime(scope: WorkerScopeLike, local?: { fetch?; sinks? }): void;
+// dist/browser/worker.js: serveBrowserRuntime(self); hosts that need fetch, in-worker sinks or hooks call it themselves.
+export function serveBrowserRuntime(scope: WorkerScopeLike, local?: { fetch?; sinks?; approveWrite?; auditReady? }): void;
 
 // dist/browser/host.js (page side, Phase 4b): no dependencies, loadable with import() from classic scripts.
 export function startBrowserRuntime(options: {
   workerUrl: string | URL;       // another origin → blob bootstrap (CORS on the bundle, CSP allows blob: workers)
-  options?: { config?; user?; baseUrl? };
+  options?: { config?; user?; baseUrl?; auditRequiredForWrites? };
   onAudit?(event): void; onToolsChanged?(tools: Tool[]): void; onError?(error: Error): void;
+  approveWrite?(call: WriteCall, { signal }): boolean | Promise<boolean>; auditReady?(): boolean | Promise<boolean>;
   clientInfo?; startTimeoutMs?: number;
 }): Promise<BrowserRuntime>;     // also connectBrowserRuntime(worker, options) for a host-made worker
 interface BrowserRuntime {
@@ -146,9 +151,11 @@ interface BrowserRuntime {
 }
 ```
 
-Worker protocol (between the two): one `{ arc1: 'start', options }` message with a MessagePort, answered by
-`{ arc1: 'ready', apiVersion, config }` or `{ arc1: 'error', message }`; audit events as `{ arc1: 'audit', event }`;
-MCP JSON-RPC on the port.
+Worker protocol (between the two): one `{ arc1: 'start', options }` message with a MessagePort (`options.pageHooks`
+names the hooks the page answers), answered by `{ arc1: 'ready', apiVersion, config }` or `{ arc1: 'error', message }`;
+audit events as `{ arc1: 'audit', event }`; stateful sessions as `{ arc1: 'session', open }`; hook questions as
+`{ arc1: 'ask', id, hook, call? }` → `{ arc1: 'answer', id, value }`, withdrawn by `{ arc1: 'cancel', id }`; MCP
+JSON-RPC on the port.
 
 - **Config** (`resolveBrowserConfig`): an allowlist of `ServerConfig` keys (safety flags and lists, feature
   toggles, tool mode, limits, `client`, `language`, labels). Anything else throws, so a URL, credentials,
@@ -167,7 +174,21 @@ MCP JSON-RPC on the port.
   The probe runs first after `connect`; `tools/list` never waits for it. `tools/list_changed` is sent only after the
   client's `initialized` notification (otherwise a fast probe notifies before `initialize` is answered).
 
-Open: whether `LogSink` gets a `ready()/healthy` signal for `auditRequiredForWrites`, or a separate `AuditGate` option.
+- **Writes** (Phase 5): `allowWrites` without `approveWrite` fails at start, so writes always need settings and
+  approval. A call is mutating when its `ACTION_POLICY` scope is `write`, `transports` or `git`, derived with the
+  normalization dispatch applies (`mutatingCall`). The gate asks only when the ceiling would run the call
+  (`allowWrites` on, action not denied); dispatch refuses the rest with its own message. Anything but `true` from the
+  hook (a throw, a cancelled call) refuses before any SAP request, as a tool error plus a `safety_blocked` audit event.
+  The hook runs outside the call queue and outside any lock (it may read through the runtime for a diff).
+  Package allowlist, deny actions and transport flags are the Node ceiling, unchanged.
+- **Audit gate** (decided 2026-10-23): a separate `auditReady` hook, not a `LogSink` health signal. `LogSink.write`
+  is fire-and-forget, and in the standard worker the host's store is behind `onAudit` on the page, so only the host
+  can say whether it can record. Checked before and after approval.
+- **Write queue**: AdtHttpClient's `statefulWindow` hook (one optional config field, 2.5's seam) wraps each stateful
+  session from its first request through the close. The browser holds the Web Lock `arc-1:adt-stateful-session` for
+  it, one per origin, not per SAP client: `sap-contextid` has path `/sap/bc/adt` whatever the client. A session opened
+  inside another one in the same runtime runs without a second request (Web Locks are not reentrant). Without Web
+  Locks (plain HTTP) writes still run, with a startup warning.
 
 ### 4.2 Seam technique
 
@@ -211,7 +232,7 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 | --- | --- | --- |
 | Outgoing HTTP | `src/adt/http.ts` (undici `Agent`/`Client`), `bounded-response.ts` (`node:stream`, undici), `request-attempt-budget.ts` (undici) | **Done (2.5):** `AdtHttpConfig.browserFetch` branch in `sendRequest()` (body in `http-browser.ts`); undici replaced by a throwing bundle-only stand-in. Byte-bounding (`capResponseBody`) was already WHATWG streams; the `node:stream`/undici imports in `bounded-response.ts` are type-only, and the Node-stream code there is the out-of-scope Connectivity proxy |
 | Cookie jar | `http.ts` `cookieJar`, `cookies.ts` (`node:fs`) | **Done (2.5), no separate option needed:** browsers hide `Set-Cookie` from scripts and drop a script-set `Cookie`, so the jar stays empty by itself; `browserFetch` refuses cookie options and strips `Cookie`. `cookies.ts` gets a bundle-only `node:fs` stand-in scoped to that file |
-| Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | **Transport done (2.5):** close is sent without `sap-contextid` whenever the clone sent a stateful request (the jar cannot see the HttpOnly cookie). Write queue (`navigator.locks`) and `pagehide` close remain Phase 5 |
+| Stateful sessions | `http.ts` `withStatefulSession` (clones jar), close via `sap-contextid` | **Transport done (2.5):** close is sent without `sap-contextid` whenever the clone sent a stateful request (the jar cannot see the HttpOnly cookie). **Done (Phase 5):** `statefulWindow` hook → Web Lock write queue; the page closes an open session on `pagehide` |
 | Request context | `src/server/context.ts` (`AsyncLocalStorage`); `.run()` in `dispatch.ts`, `http.ts` (server), `stored-text/source.ts`; 18 modules import it | **Done (2.4):** `node:async_hooks` stand-in: single-slot `AsyncLocalStorage`, valid because tool calls are serialized |
 | Hashing / random | sync `createHash('sha256')` in `cache/cache.ts`, `source-precondition.ts`, `data-source-name.ts`, `feed-schema.ts`, `diagnostics.ts`, `stored-text/{reader,source}.ts`; `randomBytes` in `data-source-policy.ts` | **Done (2.2):** `node:crypto` stand-in, sync pure-JS sha256 (`@noble/hashes`, avoids async ripple) + `crypto.getRandomValues` |
 | Compression | `http-wire-body.ts` (`gzipSync`, opt-in WAF), `stored-text/decoder.ts` (`node:zlib`, `node:util`) | **Done (2.7):** throwing bundle-only stand-ins scoped to both files. WAF gzip is refused with `browserFetch`. **Stored text is not in v1:** the decoder needs inflate's consumed-byte count (`engine.bytesWritten`), which `DecompressionStream` does not report |
@@ -238,8 +259,11 @@ test plugin rewrites the import specifiers in shared source during `transform` i
   (401), and `dispatch.ts` hints "log on to SAP again in this browser". The #1046 headerless CSRF GET (1.7.0)
   stays the only extra CSRF retry; its final failure is reported as the session end, not as a CSRF failure.
 - `sap-contextid` has path `/sap/bc/adt` (HttpOnly on 7.57, not on 7.31): a host page outside that path cannot
-  read it either way, so the close request goes without the `sap-contextid` header (verified to work on both; on
-  pre-7.50 + `abapfs_extensions` a stateless request to a 404 close path still ends the context). All tabs share it, and any explicit `stateless` ADT request ends
+  read it either way, so the close request goes without the `sap-contextid` header (verified to work on both).
+  On 7.31 + `abapfs_extensions` a stateless request to a 404 path does **not** end the context (corrected
+  2026-10-23); only one to an existing resource does (`/sap/bc/adt/discovery`). ARC-1's close (`/core/http/sessions`,
+  then `/core/discovery`, both 404 there) therefore leaves the context open; the page's `pagehide` close adds
+  `HEAD /sap/bc/adt/discovery`. All tabs share it, and any explicit `stateless` ADT request ends
   the context and its locks, so reads must send no session header.
 - `X-sap-adt-sessiontype`, `X-CSRF-Token`, `Accept`/`Content-Type` custom headers are fine same-origin.
 
@@ -406,14 +430,29 @@ The helper hides the worker protocol and MCP from the host.
 
 ### Phase 5: Writes
 
-- [ ] `approveWrite` hook in the browser dispatch wrapper, using `ACTION_POLICY` scope to decide what counts as mutating; deny → tool error, nothing sent to SAP
-- [ ] Write queue across tabs (`navigator.locks`, one lock name per origin + SAP client), covering lock → modify → unlock → close-session (spike 6b: one tab's close releases another tab's locks)
-- [ ] Browser transport never sends `X-sap-adt-sessiontype: stateless` outside the close request, and drops the `sap-contextid` header (HttpOnly; close works without it)
-- [ ] While a stateful window is open, register a `pagehide` handler that sends a `keepalive` stateless close-session (spike 8b: releases an orphaned lock immediately instead of after ~30 min)
-- [ ] `auditRequiredForWrites`: refuse mutations when no sink can record; reads unaffected
-- [ ] Package allowlist, deny actions and transport gates via config, same enforcement as Node
-- [ ] Live CRUD on `$TMP` in the browser harness: create, update, `edit_method`, activate, delete; plus lock conflict and tab-close cases
-- [ ] Lint-before-write on (abaplint is already in the bundle, not lazy-loaded): verify per-write lint latency in the worker
+Contract in §4.1 (Writes, Audit gate, Write queue). Unit tests: `tests/unit/browser/browser-writes.test.ts`, the
+writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live results:
+`docs/research/2026-10-23-browser-runtime-live-write.md`.
+
+- [x] `approveWrite` hook in the browser dispatch wrapper, using `ACTION_POLICY` scope to decide what counts as mutating; deny → tool error, nothing sent to SAP
+  - Required with `allowWrites` (start fails without it); runs outside the call queue; refusal audited as `safety_blocked`
+  - Through the host helper: the worker asks the page (`ask`/`answer`), and a cancelled call aborts the page's dialog
+- [x] Write queue across tabs (`navigator.locks`), covering lock → modify → unlock → close-session (spike 6b: one tab's close releases another tab's locks)
+  - One lock per origin, not per SAP client: the `sap-contextid` cookie is shared by every client on the origin
+  - `http.ts` +6 lines (`statefulWindow`); the lock itself lives in `src/browser/write-gate.ts`
+- [x] Browser transport never sends `X-sap-adt-sessiontype: stateless` outside the close request, and drops the `sap-contextid` header (HttpOnly; close works without it). Already true since 2.5; now asserted for a whole write in unit and live tests
+- [x] While a stateful window is open, register a `pagehide` handler that sends a `keepalive` stateless close-session (spike 8b: releases an orphaned lock immediately instead of after ~30 min)
+  - In the host helper (a worker sees no page lifecycle): the worker reports `{ arc1: 'session', open }`; stopping the runtime with a session open sends the close too
+  - Sends `GET /core/http/sessions` and `HEAD /sap/bc/adt/discovery`, both stateless: on 7.31 only the second ends the context (found by the 7.31 live run)
+- [x] `auditRequiredForWrites`: refuse mutations unless the host's `auditReady` hook confirms; reads unaffected
+- [x] Package allowlist, deny actions and transport gates via config, same enforcement as Node (unit-tested; denied actions never reach the approval hook)
+- [x] Live CRUD on `$TMP` in the browser harness: create, update, `edit_method`, activate, delete; plus lock conflict and tab-close cases (7.57 and 7.31, 8/8 each)
+  - Tab close: Playwright cannot intercept a dedicated worker's requests, so the dev server got a test-only `holdRequest` option that holds the PUT at the proxy
+- [x] Lint-before-write on (abaplint is already in the bundle, not lazy-loaded): verify per-write lint latency in the worker — 9–22 ms per lint of a small class (7.57)
+- [x] Live writes on system A (7.31, `abapfs_extensions`): 21/21 after the `pagehide` fix above
+- [ ] Decide: ARC-1's own close (`http.ts` `closeStatefulSession`) leaves the context open on 7.31 + `abapfs_extensions`
+  (Node and browser). Harmless while UNLOCK succeeds; if UNLOCK fails, the lock stays until the session times out.
+  Candidate upstream fix: a final `/sap/bc/adt/discovery` fallback (see §6 risk 13)
 
 ### Phase 6: Upstream proposal
 
@@ -456,7 +495,17 @@ The helper hides the worker protocol and MCP from the host.
    the bundle origin in `script-src`; a customer CSP that forbids either needs the ABAP-served variant instead.
    Loading code from another origin into the ABAP origin is the same trust step the host already takes for its
    own scripts.
-9. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
+9. **Open:** BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1). Audit gate shape: decided (§4.1, a
+   separate `auditReady` hook).
+11. **Plain HTTP SAP origins** have no Web Locks (secure contexts only): writes from two tabs can end each other's
+   locks there. The runtime warns at start; an HTTPS origin (or the ABAP-served bundle on HTTPS) avoids it.
+12. **Parallel stateful sessions inside one tool call** share the browser's single ADT context (Node gives each its
+   own cookie jar), so the first close would end the second's lock. No current write path opens two at once; one
+   nested inside another runs without a second Web Lock request.
+13. **ARC-1's close does not end the context on 7.31 + `abapfs_extensions`** (both close paths are 404, and a 404
+   leaves the context open there). After a normal write only the lock-free context remains until the session
+   times out; after a failed UNLOCK the lock remains too. Node is affected the same way (its context is private
+   to the clone, so only the lock matters there). The page's `pagehide` close covers a closed tab.
 10. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
    from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
    and never send `stateless` on reads.
@@ -472,7 +521,8 @@ The helper hides the worker protocol and MCP from the host.
   SAP host, so the session never reaches the proxy origin; open a path that challenges directly instead (system B:
   `/sap/opu/odata/UI5/ABAP_REPOSITORY_SRV`), or the same ADT URL a second time. Then start the runtime and call
   tools from the page. The proxy drops `Domain` (and `Secure` and `SameSite=None` on plain HTTP) from SAP cookies
-  and maps SAP-origin redirects back to the local origin.
+  and maps SAP-origin redirects back to the local origin. With `{"allowWrites": true}` in the harness config, each
+  write asks for approval in a `confirm()` dialog showing the call's arguments.
 - Never commit SAP URLs, users or cookies; use `.env` (gitignored) for the proxy target.
 - Use `$TMP` and `generateUniqueName()`-style names for write tests; clean up best-effort.
 
@@ -482,7 +532,7 @@ The helper hides the worker protocol and MCP from the host.
 
 - [ ] Node build: zero behavior change; all upstream gates green; tool-definition fixtures byte-identical
 - [ ] Browser bundle: no forbidden imports; within size budget; read and write tools pass live in a real browser on ≥2 SAP releases
-- [ ] Safe defaults verified: no config → read-only; writes require config + approval (+ audit if required)
+- [x] Safe defaults verified: no config → read-only; writes require config + approval (+ audit if required)
 - [ ] ADR-0010, docs page, roadmap update and PR descriptions with live-test evidence ready for upstream
 
 ---

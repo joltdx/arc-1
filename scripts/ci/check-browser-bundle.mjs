@@ -15,7 +15,7 @@ import { build } from 'esbuild';
 import { browserBundleOptions, browserHostOptions, bundleBytes } from '../browser/build.mjs';
 
 export const BUDGET_BYTES = 4_350_000;
-export const HOST_BUDGET_BYTES = 4_200;
+export const HOST_BUDGET_BYTES = 5_200;
 const STALE_RATIO = 0.9;
 
 /** Packages that must never reach the browser bundle. */

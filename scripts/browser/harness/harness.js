@@ -3,7 +3,8 @@
 // - Raw relay (tests/browser-live/, SDK client): the test drives `window.arc1Harness.start/send` and receives every
 //   message the worker sends through `window.arc1OnMessage`, like a backend MCP client behind a relay transport.
 // - Host helper (`/bundle/host.js`, as an embedding page uses it): `arc1Harness.startHost/hostCall`, and the form
-//   below. `workerUrl` on another origin exercises the blob bootstrap.
+//   below. `workerUrl` on another origin exercises the blob bootstrap. Each write asks for approval: the form
+//   uses `confirm()`, a test sets `arc1Harness.approve` and reads `arc1Harness.approvals`.
 
 const harness = {
   worker: undefined,
@@ -11,6 +12,10 @@ const harness = {
   runtime: undefined,
   audit: [],
   toolsChanged: 0,
+  /** Host helper: the answer to each write approval (tests), or 'confirm' to ask in a dialog. */
+  approve: true,
+  /** Host helper: every write the runtime asked to approve. */
+  approvals: [],
   /** Raw relay: start the worker with BrowserServerOptions (without fetch or sinks); resolves with its config. */
   start(options = {}) {
     if (harness.worker || harness.runtime) throw new Error('Runtime already started; reload the page to start again.');
@@ -45,6 +50,11 @@ const harness = {
       clientInfo: { name: 'arc-1-harness', version: '1' },
       onAudit: (event) => harness.audit.push(event),
       onToolsChanged: () => harness.toolsChanged++,
+      approveWrite: (call) => {
+        harness.approvals.push(call);
+        if (harness.approve !== 'confirm') return harness.approve;
+        return window.confirm(`Approve ${call.tool} ${call.action ?? ''}?\n\n${JSON.stringify(call.args, null, 2)}`);
+      },
     });
     const { apiVersion, config, serverInfo } = harness.runtime;
     return { apiVersion, config, serverInfo };
@@ -67,6 +77,7 @@ $('start').addEventListener('click', async () => {
   try {
     const config = JSON.parse($('config').value || '{}');
     const user = $('user').value.trim() || undefined;
+    harness.approve = 'confirm';
     const started = await harness.startHost({ options: { config, user } });
     showJson(`started (API v${started.apiVersion}, ${started.serverInfo.name} ${started.serverInfo.version}):`, started.config);
     for (const id of ['list', 'call']) $(id).disabled = false;
