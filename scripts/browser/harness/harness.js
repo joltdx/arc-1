@@ -1,20 +1,23 @@
-// Harness page for the ARC-1 browser runtime: starts the worker and relays MCP JSON-RPC to it.
+// Harness page for the ARC-1 browser runtime. Both paths start the bundle's standard worker (`/bundle/worker.js`).
 //
-// - Automated (tests/browser-live/): the test drives `window.arc1Harness` and receives every message the
-//   worker sends through `window.arc1OnMessage`, like a backend MCP client behind a relay transport.
-// - Manual: the form below starts the runtime and sends tools/list and tools/call, showing the replies.
+// - Raw relay (tests/browser-live/, SDK client): the test drives `window.arc1Harness.start/send` and receives every
+//   message the worker sends through `window.arc1OnMessage`, like a backend MCP client behind a relay transport.
+// - Host helper (`/bundle/host.js`, as an embedding page uses it): `arc1Harness.startHost/hostCall`, and the form
+//   below. `workerUrl` on another origin exercises the blob bootstrap.
 
 const harness = {
   worker: undefined,
   port: undefined,
+  runtime: undefined,
   audit: [],
-  /** Start the runtime with BrowserServerOptions (without fetch or sinks); resolves with its resolved config. */
+  toolsChanged: 0,
+  /** Raw relay: start the worker with BrowserServerOptions (without fetch or sinks); resolves with its config. */
   start(options = {}) {
-    if (harness.worker) throw new Error('Runtime already started; reload the page to start again.');
+    if (harness.worker || harness.runtime) throw new Error('Runtime already started; reload the page to start again.');
     const channel = new MessageChannel();
-    harness.worker = new Worker('/harness/worker.js', { type: 'module' });
+    harness.worker = new Worker('/bundle/worker.js', { type: 'module' });
     harness.port = channel.port1;
-    harness.port.onmessage = (event) => deliver(event.data);
+    harness.port.onmessage = (event) => window.arc1OnMessage?.(event.data);
     const ready = new Promise((resolve, reject) => {
       harness.worker.onmessage = (event) => {
         const data = event.data;
@@ -27,33 +30,32 @@ const harness = {
     harness.worker.postMessage({ arc1: 'start', options }, [channel.port2]);
     return ready;
   },
-  /** Relay one JSON-RPC message to the runtime. */
+  /** Raw relay: send one JSON-RPC message to the runtime. */
   send(message) {
     if (!harness.port) throw new Error('Runtime not started.');
     harness.port.postMessage(message);
   },
+  /** Host helper: start through host.js from the worker's directory; resolves with a summary. */
+  async startHost({ workerUrl = '/bundle/worker.js', options = {} } = {}) {
+    if (harness.worker || harness.runtime) throw new Error('Runtime already started; reload the page to start again.');
+    const { startBrowserRuntime } = await import(new URL('host.js', new URL(workerUrl, location.href)).href);
+    harness.runtime = await startBrowserRuntime({
+      workerUrl,
+      options,
+      clientInfo: { name: 'arc-1-harness', version: '1' },
+      onAudit: (event) => harness.audit.push(event),
+      onToolsChanged: () => harness.toolsChanged++,
+    });
+    const { apiVersion, config, serverInfo } = harness.runtime;
+    return { apiVersion, config, serverInfo };
+  },
+  /** Host helper: one tool call, with CallToolOptions minus the signal. */
+  hostCall(name, args, options) {
+    if (!harness.runtime) throw new Error('Runtime not started through the host helper.');
+    return harness.runtime.callTool(name, args, options);
+  },
 };
 window.arc1Harness = harness;
-
-const pending = new Map();
-let nextId = 1;
-
-function deliver(message) {
-  window.arc1OnMessage?.(message);
-  const waiter = pending.get(message.id);
-  if (waiter && ('result' in message || 'error' in message)) {
-    pending.delete(message.id);
-    waiter(message);
-  }
-  if (!('id' in message)) show(`← ${message.method}`);
-}
-
-function call(method, params) {
-  const id = `ui-${nextId++}`;
-  const reply = new Promise((resolve) => pending.set(id, resolve));
-  harness.send({ jsonrpc: '2.0', id, method, params });
-  return reply;
-}
 
 const $ = (id) => document.getElementById(id);
 const show = (text) => {
@@ -65,15 +67,8 @@ $('start').addEventListener('click', async () => {
   try {
     const config = JSON.parse($('config').value || '{}');
     const user = $('user').value.trim() || undefined;
-    const { apiVersion, config: resolved } = await harness.start({ config, user });
-    showJson(`started (API v${apiVersion}); resolved config:`, resolved);
-    const init = await call('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: {},
-      clientInfo: { name: 'arc-1-harness', version: '1' },
-    });
-    harness.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-    showJson('initialize', init.result ?? init.error);
+    const started = await harness.startHost({ options: { config, user } });
+    showJson(`started (API v${started.apiVersion}, ${started.serverInfo.name} ${started.serverInfo.version}):`, started.config);
     for (const id of ['list', 'call']) $(id).disabled = false;
     $('start').disabled = true;
   } catch (err) {
@@ -82,18 +77,19 @@ $('start').addEventListener('click', async () => {
 });
 
 $('list').addEventListener('click', async () => {
-  const reply = await call('tools/list', {});
-  show(`tools/list: ${(reply.result?.tools ?? []).map((tool) => tool.name).join(', ') || JSON.stringify(reply.error)}`);
+  const tools = await harness.runtime.listTools();
+  show(`tools/list (${harness.toolsChanged} list change(s) so far): ${tools.map((tool) => tool.name).join(', ')}`);
 });
 
 $('call').addEventListener('click', async () => {
   try {
     const args = JSON.parse($('args').value || '{}');
+    const max = Number($('max').value) || undefined;
     const started = performance.now();
-    const reply = await call('tools/call', { name: $('tool').value.trim(), arguments: args });
+    const result = await harness.hostCall($('tool').value.trim(), args, max ? { maxResultChars: max } : {});
     const ms = Math.round(performance.now() - started);
-    const content = reply.result?.content?.map((part) => part.text ?? JSON.stringify(part)).join('\n');
-    show(`${$('tool').value} (${ms} ms${reply.result?.isError ? ', isError' : ''})\n${content ?? JSON.stringify(reply.error)}`);
+    const content = result.content.map((part) => part.text ?? JSON.stringify(part)).join('\n');
+    show(`${$('tool').value} (${ms} ms${result.isError ? ', isError' : ''})\n${content}`);
   } catch (err) {
     show(`call failed: ${err.message}`);
   }
