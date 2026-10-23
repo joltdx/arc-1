@@ -22,17 +22,23 @@ regarding the hosted ARC-1
 
 ### 1.2 Decision
 
-Run ARC-1 **in the user's browser** (Web Worker inside the ai client). The web app is served
-from the **same origin** as the ABAP system, so ADT calls are same-origin `fetch` requests using
-the user's existing SAP session. The ai backend stays an MCP client; its transport tunnels
-JSON-RPC messages through an "ai client tool" call to the browser.
+Run ARC-1 **in the user's browser** (Web Worker inside the ai client). The web app runs on the
+**same origin** as the ABAP system, so ADT calls are same-origin `fetch` requests using the user's
+existing SAP session. The ai backend does not speak MCP to the browser: it already relays "client
+tools" (decided 2026-10-23 after reading the first host's code). The ai client registers ARC-1's
+tool list with the backend, the backend offers those tools to the LLM, and each tool call travels
+to the browser and its result back over the host's own channel. MCP runs only between the page and
+the worker, behind a small page-side helper (Phase 4b).
 
 ```text
-External LLM ⇄ ai backend (vendor, MCP client w/ relay transport)
-                  │  each JSON-RPC message = one "ai client tool" call
+External LLM ⇄ ai backend (vendor; offers the registered client tools to the LLM)
+                  │  host channel: register tool list; each tool call → browser → result
                   ▼
-ai client (browser, same origin as ABAP)
-  └─ Web Worker: ARC-1 browser runtime  (this plan)
+ai client (browser page on the ABAP origin)
+  └─ host helper (arc-1 host.js): listTools / callTool / onToolsChanged / onAudit
+       │  MCP JSON-RPC over a MessagePort
+       ▼
+     Web Worker: ARC-1 browser runtime  (this plan)
        ├─ MCP Server: initialize / tools/list / tools/call
        ├─ config        ← supplied by host (platform loads it from SAP side)
        ├─ audit sinks   → supplied by host (platform writes to SAP side)
@@ -56,8 +62,10 @@ ai client (browser, same origin as ABAP)
 - **ARC-1 (this repo, upstreamable):** generic browser runtime with injection points. No SAP-side
   endpoints required. Safe defaults: read-only, console audit sink, no approval hook.
 - **Host platform (separate repo, NOT here):** SAP-side settings storage and loader, SAP-side
-  audit endpoint + `LogSink` implementation, approval UI, backend relay transport, deployment of
-  the bundle into the ABAP system (UI5 repository / BSP) as customer-controlled code.
+  audit endpoint + `LogSink` implementation, approval UI, backend tool relay, and serving the bundle:
+  either from the ABAP system (UI5 repository / BSP, e.g. a small transport next to the platform) or
+  from the host's own web server, which needs CORS for the bundle files and a host CSP that allows the
+  worker (see §6). Hosts that relay results must not silently cut tool output (see Phase 4b).
 
 ---
 
@@ -119,7 +127,28 @@ export function createBrowserServer(options?: BrowserServerOptions): {
   close(): Promise<void>;
 };
 export { MessagePortTransport, type MessagePortLike }; // Worker, MessagePort or the worker's own scope
+
+// dist/browser/worker.js: serveBrowserRuntime(self); hosts that need fetch or in-worker sinks call it themselves.
+export function serveBrowserRuntime(scope: WorkerScopeLike, local?: { fetch?; sinks? }): void;
+
+// dist/browser/host.js (page side, Phase 4b): no dependencies, loadable with import() from classic scripts.
+export function startBrowserRuntime(options: {
+  workerUrl: string | URL;       // another origin → blob bootstrap (CORS on the bundle, CSP allows blob: workers)
+  options?: { config?; user?; baseUrl? };
+  onAudit?(event): void; onToolsChanged?(tools: Tool[]): void; onError?(error: Error): void;
+  clientInfo?; startTimeoutMs?: number;
+}): Promise<BrowserRuntime>;     // also connectBrowserRuntime(worker, options) for a host-made worker
+interface BrowserRuntime {
+  apiVersion; config; serverInfo; instructions?;
+  listTools(): Promise<Tool[]>;
+  callTool(name, args?, { signal?, maxResultChars? }?): Promise<CallToolResult>; // tool errors: isError
+  close(): void;
+}
 ```
+
+Worker protocol (between the two): one `{ arc1: 'start', options }` message with a MessagePort, answered by
+`{ arc1: 'ready', apiVersion, config }` or `{ arc1: 'error', message }`; audit events as `{ arc1: 'audit', event }`;
+MCP JSON-RPC on the port.
 
 - **Config** (`resolveBrowserConfig`): an allowlist of `ServerConfig` keys (safety flags and lists, feature
   toggles, tool mode, limits, `client`, `language`, labels). Anything else throws, so a URL, credentials,
@@ -344,7 +373,36 @@ Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
   - [x] Spike test 9 manually through `npm run dev:browser` in Edge on system B (log off, then call a tool):
     silent success, no credentials dialog (2026-10-22)
 - [x] Re-auth error surfaces as a clear tool error (§4.4); live on 7.31 and 7.57 without a logon
-- [ ] Platform team wires the relay transport (outside this repo) and confirms backend MCP client works unchanged
+- [ ] Platform team wires the tool relay (outside this repo): register the tool list from the host helper with the
+  backend, relay each call through `callTool`. Decided 2026-10-23: the backend relays client tools over its own
+  channel instead of running an MCP client against the browser (Phase 4b)
+
+### Phase 4b: Host helper (page side)
+
+The first host has no MCP SDK in the page and loads its own scripts from its web server, not from the ABAP origin.
+The helper hides the worker protocol and MCP from the host.
+
+- [x] Standard worker entry `dist/browser/worker.js` (`src/browser/worker.ts`, logic in `worker-runtime.ts`): the
+  start/ready/error/audit protocol the harness worker had, for every host. Shares chunks with `index.js`
+- [x] `dist/browser/host.js` (`src/browser/host.ts`, 3.9 KB minified): a single small ESM file with no dependencies, importable from
+  classic scripts with `import()`. `startBrowserRuntime({ workerUrl, options, onAudit, onToolsChanged })` starts
+  the worker, then `initialize`; returns `{ apiVersion, config, instructions, listTools, callTool, close }`.
+  `connectBrowserRuntime(worker, …)` for hosts that create the worker themselves
+- [x] Cross-origin bundle: when `workerUrl` is on another origin, start the worker from a `blob:` module that
+  imports it, so the worker runs on the page's (ABAP) origin and its ADT fetches stay same-origin. The bundle's
+  server then needs CORS for the entry and every chunk, and the host CSP must allow `blob:` workers (`worker-src`)
+- [x] `callTool(name, args, { signal, maxResultChars })`: abort sends `notifications/cancelled`; the opt-in cap cuts
+  text content and says so in the result, with a hint to narrow the read, so a relay never has to cut blindly.
+  An abort rejects at once; the runtime then aborts SAP requests only where upstream passes the request signal
+  down (feeds, ATC/CI, include expansion, syntax batches). Other calls finish and their answer is dropped, so the
+  next call waits for them (calls are serialized)
+- [x] Answers `ping` from the server; refuses other server requests (no sampling or elicitation in v1)
+- [x] Build, bundle check (host budget, no packages in `host.js`), unit tests with an in-process worker
+  (`tests/unit/browser/host.test.ts`), harness page uses the helper (`harness/worker.js` removed), dev server sends
+  CORS on `/bundle/*`
+- [x] Live (2026-10-23, system A, 7.31): 13/13, including the helper with the bundle served by a second dev server
+  on another origin: blob bootstrap, chunks loaded cross-origin, every SAP request on the page origin, parity with
+  Node, result cut, audit and tool-list change forwarded. System B (7.57) not rerun
 
 ### Phase 5: Writes
 
@@ -392,8 +450,14 @@ Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
    280–360 ms; a real network download from the ABAP server is still to be measured in the host app.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
-8. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
-9. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
+8. **Bundle served from another origin than SAP** (the host's own web server, preferred by the first host for
+   updates independent of SAP transports): a module Worker must be same-origin, so the helper starts it from a
+   `blob:` bootstrap (Phase 4b). Requires CORS on every bundle file and a host CSP allowing `blob:` workers and
+   the bundle origin in `script-src`; a customer CSP that forbids either needs the ABAP-served variant instead.
+   Loading code from another origin into the ABAP origin is the same trust step the host already takes for its
+   own scripts.
+9. **Open:** audit gate shape (sink health vs separate gate); BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1).
+10. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
    from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
    and never send `stateless` on reads.
 

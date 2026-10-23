@@ -48,7 +48,7 @@ export function rewriteLocation(location, targetOrigin, localOrigin) {
   return location.startsWith(targetOrigin) ? localOrigin + location.slice(targetOrigin.length) : location;
 }
 
-function serveFile(res, dir, relativePath) {
+function serveFile(res, dir, relativePath, extraHeaders = {}) {
   const file = normalize(join(dir, relativePath));
   if (!(file === dir || file.startsWith(dir + sep)) || !existsSync(file) || !statSync(file).isFile()) {
     res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
@@ -57,6 +57,7 @@ function serveFile(res, dir, relativePath) {
   res.writeHead(200, {
     'content-type': CONTENT_TYPES[extname(file)] ?? 'application/octet-stream',
     'cache-control': 'no-store',
+    ...extraHeaders,
   });
   createReadStream(file).pipe(res);
 }
@@ -109,7 +110,10 @@ export async function startDevServer({ target, port = 0, host = '127.0.0.1', bun
     if (path === '/sap' || path.startsWith('/sap/')) return proxy(req, res, targetUrl, localOrigin, insecure);
     if (path === '/') return serveFile(res, HARNESS_DIR, 'index.html');
     if (path.startsWith('/harness/')) return serveFile(res, HARNESS_DIR, decodeURIComponent(path.slice(9)));
-    if (path.startsWith('/bundle/')) return serveFile(res, bundle, decodeURIComponent(path.slice(8)));
+    // CORS lets a page on another origin start the bundle through the host helper's blob bootstrap.
+    if (path.startsWith('/bundle/')) {
+      return serveFile(res, bundle, decodeURIComponent(path.slice(8)), { 'access-control-allow-origin': '*' });
+    }
     res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
   });
   await new Promise((resolveListen, reject) => {
