@@ -26,8 +26,10 @@ import {
   setCachedDiscovery,
 } from '../handlers/feature-cache.js';
 import { createQueryDefinition } from '../handlers/query-tool.js';
+import { errorResult } from '../handlers/shared.js';
 import { getToolDefinitions, type ToolDefinition } from '../handlers/tools.js';
 import { generateRequestId } from '../server/context.js';
+import { isActionDenied } from '../server/deny-actions.js';
 import { initLogger, logger } from '../server/logger.js';
 import { buildServerInstructions } from '../server/server-instructions.js';
 import type { LogSink } from '../server/sinks/types.js';
@@ -35,10 +37,27 @@ import { filterToolsByAuthScope } from '../server/tool-auth.js';
 import type { ServerConfig } from '../server/types.js';
 import { VERSION } from '../version.js';
 import { type BrowserServerConfig, resolveBrowserConfig } from './config.js';
+import {
+  type ApproveWrite,
+  type AuditReady,
+  createStatefulWindow,
+  defaultLockManager,
+  type LockManagerLike,
+  mutatingCall,
+  type WriteCall,
+  warnWithoutLocks,
+} from './write-gate.js';
 
 export type { LogSink } from '../server/sinks/types.js';
 export type { BrowserServerConfig } from './config.js';
 export { type MessagePortLike, MessagePortTransport } from './message-port-transport.js';
+export {
+  ADT_SESSION_LOCK,
+  type ApproveWrite,
+  type AuditReady,
+  type LockManagerLike,
+  type WriteCall,
+} from './write-gate.js';
 
 /** Contract version of this entry point; bumped on any breaking change while @experimental. */
 export const BROWSER_API_VERSION = 1;
@@ -57,6 +76,24 @@ export interface BrowserServerOptions {
   user?: string;
   /** Audit sinks in addition to the console. */
   sinks?: LogSink[];
+  /**
+   * Approve each mutating call (write, transport or git scope) before it reaches SAP; required when
+   * `config.allowWrites` is on. Runs outside the call queue and outside any SAP lock, so it may read
+   * through the runtime (for a diff); the arguments may still fail validation afterwards.
+   */
+  approveWrite?: ApproveWrite;
+  /** Refuse mutating calls unless `auditReady` confirms the host's audit store can record. Reads are unaffected. */
+  auditRequiredForWrites?: boolean;
+  /** Whether the host's audit store can record now; required with `auditRequiredForWrites`. */
+  auditReady?: AuditReady;
+  /**
+   * Reports when a stateful ADT session (lock → modify → unlock → close) opens and closes. While one is
+   * open, the page should close it on `pagehide` (host.js does), or SAP keeps its locks until the session
+   * times out.
+   */
+  onStatefulSessionChange?: (open: boolean) => void;
+  /** Cross-tab queue for stateful sessions. Default: `navigator.locks`; `null` turns the queue off (tests). */
+  locks?: LockManagerLike | null;
 }
 
 export interface BrowserServer {
@@ -92,13 +129,19 @@ function resolveBaseUrl(baseUrl: string | undefined): string {
 }
 
 /** Create the client the browser runtime dispatches through: browser transport, host user, config ceiling. */
-export function createBrowserClient(config: ServerConfig, fetchImpl: typeof fetch, baseUrl: string): AdtClient {
+export function createBrowserClient(
+  config: ServerConfig,
+  fetchImpl: typeof fetch,
+  baseUrl: string,
+  statefulWindow?: <T>(run: () => Promise<T>) => Promise<T>,
+): AdtClient {
   const http = new AdtHttpClient({
     baseUrl,
     client: config.client,
     language: config.language,
     browserFetch: fetchImpl,
     semaphore: new Semaphore(config.maxConcurrent),
+    ...(statefulWindow ? { statefulWindow } : {}),
   });
   return new AdtClient({
     http,
@@ -149,12 +192,21 @@ export function browserToolDefinitions(config: ServerConfig): ToolDefinition[] {
  */
 export function createBrowserServer(options: BrowserServerOptions = {}): BrowserServer {
   const config = Object.freeze(resolveBrowserConfig(options.config, options.user));
+  if (config.allowWrites && typeof options.approveWrite !== 'function') {
+    throw new Error('allowWrites needs an approveWrite hook (pass () => true to approve every write).');
+  }
+  if (options.auditRequiredForWrites && typeof options.auditReady !== 'function') {
+    throw new Error('auditRequiredForWrites needs an auditReady hook.');
+  }
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
-  const client = createBrowserClient(config, fetchImpl, resolveBaseUrl(options.baseUrl));
+  const locks = options.locks === null ? undefined : (options.locks ?? defaultLockManager());
+  const statefulWindow = createStatefulWindow(locks, options.onStatefulSessionChange);
+  const client = createBrowserClient(config, fetchImpl, resolveBaseUrl(options.baseUrl), statefulWindow);
   const cachingLayer = config.cacheMode === 'none' ? undefined : new CachingLayer(new MemoryCache(), 0);
 
   initLogger(config.logFormat, config.logLevel);
   for (const sink of options.sinks ?? []) logger.addSink(sink);
+  if (options.locks !== null) warnWithoutLocks(config.allowWrites, locks);
 
   const authInfo: AuthInfo = {
     token: '',
@@ -179,14 +231,52 @@ export function createBrowserServer(options: BrowserServerOptions = {}): Browser
   // Like Node, never wait for the probe here: answer with what is known and announce the narrowed list later.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: browserToolDefinitions(config) }));
 
-  server.setRequestHandler(CallToolRequestSchema, (request, extra) =>
-    serialize(async () => {
+  /** Refusal text when a mutating call may not run, else undefined. Fails closed on a throwing hook. */
+  const writeRefusal = async (call: WriteCall, signal: AbortSignal): Promise<string | undefined> => {
+    const auditReady = async (): Promise<boolean> =>
+      !options.auditRequiredForWrites ||
+      (await Promise.resolve()
+        .then(() => options.auditReady?.())
+        .catch(() => false)) === true;
+    if (!(await auditReady())) return 'the audit store cannot record right now';
+    const approved = await Promise.resolve()
+      .then(() => options.approveWrite?.(call, { signal }))
+      .catch(() => false);
+    if (signal.aborted) return 'the call was cancelled while waiting for approval';
+    if (approved !== true) return 'the user did not approve it';
+    if (!(await auditReady())) return 'the audit store cannot record right now';
+    return undefined;
+  };
+
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const name = request.params.name;
+    const args = (request.params.arguments ?? {}) as Record<string, unknown>;
+    // Only calls the ceiling would run reach the host; dispatch refuses the others with its own message.
+    const call = config.allowWrites ? mutatingCall(name, args) : undefined;
+    if (call && !isActionDenied(call.tool, call.action, config.denyActions)) {
+      const reason = await writeRefusal(call, extra.signal);
+      if (reason) {
+        const operation = `${call.tool}${call.action ? `.${call.action}` : ''}`;
+        logger.emitAudit({
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          event: 'safety_blocked',
+          requestId: generateRequestId(),
+          user: config.username || undefined,
+          clientId: authInfo.clientId,
+          operation,
+          reason: `Browser host: ${reason}`,
+        });
+        return { ...errorResult(`${operation} was not run: ${reason}. Nothing was sent to SAP.`) };
+      }
+    }
+    return serialize(async () => {
       client.http.setDiscoveryMap(getCachedDiscovery());
       const result = await handleToolCall(
         client,
         config,
-        request.params.name,
-        (request.params.arguments ?? {}) as Record<string, unknown>,
+        name,
+        args,
         authInfo,
         server,
         cachingLayer,
@@ -197,8 +287,8 @@ export function createBrowserServer(options: BrowserServerOptions = {}): Browser
         extra.signal,
       );
       return { ...result } as Record<string, unknown>;
-    }),
-  );
+    });
+  });
 
   const initialized = new Promise<void>((resolve) => {
     server.oninitialized = resolve;

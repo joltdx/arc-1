@@ -97,17 +97,26 @@ function proxy(req, res, target, localOrigin, insecure) {
 
 /**
  * Start the dev server. `/` and `/harness/*` serve the harness, `/bundle/*` the browser bundle and `/sap/*` is
- * proxied to `target`.
- * @param {{ target: string, port?: number, host?: string, bundleDir?: string, insecure?: boolean }} options
+ * proxied to `target`. `holdRequest` (tests) may return a promise for a `/sap/*` request: the proxy forwards the
+ * request once it resolves and drops it if it rejects (Playwright cannot intercept a dedicated worker's requests).
+ * @param {{ target: string, port?: number, host?: string, bundleDir?: string, insecure?: boolean,
+ *   holdRequest?: (req: import('node:http').IncomingMessage) => Promise<void> | undefined }} options
  * @returns {Promise<{ url: string, close: () => Promise<void> }>}
  */
-export async function startDevServer({ target, port = 0, host = '127.0.0.1', bundleDir, insecure = false }) {
+export async function startDevServer({ target, port = 0, host = '127.0.0.1', bundleDir, insecure = false, holdRequest }) {
   const targetUrl = new URL(target);
   const bundle = resolve(bundleDir ?? join(root, 'dist', 'browser'));
   let localOrigin = '';
   const server = createServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://local').pathname;
-    if (path === '/sap' || path.startsWith('/sap/')) return proxy(req, res, targetUrl, localOrigin, insecure);
+    if (path === '/sap' || path.startsWith('/sap/')) {
+      const held = holdRequest?.(req);
+      if (!held) return proxy(req, res, targetUrl, localOrigin, insecure);
+      return held.then(
+        () => proxy(req, res, targetUrl, localOrigin, insecure),
+        () => res.destroy(),
+      );
+    }
     if (path === '/') return serveFile(res, HARNESS_DIR, 'index.html');
     if (path.startsWith('/harness/')) return serveFile(res, HARNESS_DIR, decodeURIComponent(path.slice(9)));
     // CORS lets a page on another origin start the bundle through the host helper's blob bootstrap.

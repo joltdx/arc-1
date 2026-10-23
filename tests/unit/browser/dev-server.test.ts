@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingHttpHeaders, request, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { rewriteLocation, rewriteSetCookie, startDevServer } from '../../../scripts/browser/dev-server.mjs';
 
 describe('dev-server rewrites', () => {
@@ -102,5 +102,38 @@ describe('startDevServer', () => {
     expect(await status('/bundle/%2e%2e/%2e%2e/package.json')).toBe(404);
     expect(await status('/harness/..%2f..%2f..%2fpackage.json')).toBe(404);
     expect(await status('/package.json')).toBe(404);
+  });
+
+  it('holds a proxied request until the test releases it, and drops it on rejection', async () => {
+    let release!: () => void;
+    let drop!: () => void;
+    const held = await startDevServer({
+      target: upstreamUrl,
+      bundleDir,
+      holdRequest: (req) =>
+        req.method !== 'PUT'
+          ? undefined
+          : new Promise<void>((resolve, reject) => {
+              if (req.url?.includes('keep')) release = resolve;
+              else drop = () => reject(new Error('dropped'));
+            }),
+    });
+    try {
+      seen = {};
+      const kept = fetch(`${held.url}/sap/keep`, { method: 'PUT', body: 'x', redirect: 'manual' });
+      await vi.waitFor(() => expect(release).toBeDefined());
+      expect(seen.url).toBeUndefined();
+      release();
+      expect((await kept).status).toBe(302);
+      expect(seen).toMatchObject({ url: '/sap/keep', body: 'x' });
+
+      const dropped = fetch(`${held.url}/sap/drop`, { method: 'PUT', body: 'y', redirect: 'manual' });
+      await vi.waitFor(() => expect(drop).toBeDefined());
+      drop();
+      await expect(dropped).rejects.toThrow();
+      expect(seen.url).toBe('/sap/keep');
+    } finally {
+      await held.close();
+    }
   });
 });

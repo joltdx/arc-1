@@ -15,8 +15,10 @@
 
 import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { BrowserServerConfig } from './config.js';
+import type { WriteCall } from './write-gate.js';
 
 export type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
+export type { WriteCall } from './write-gate.js';
 
 /** MCP protocol version the helper asks for; the runtime's SDK supports it (checked by a unit test). */
 export const HOST_PROTOCOL_VERSION = '2025-11-25';
@@ -26,6 +28,8 @@ export interface BrowserRuntimeOptions {
   config?: Partial<BrowserServerConfig>;
   user?: string;
   baseUrl?: string;
+  /** Refuse mutating calls unless `auditReady` (in `ConnectOptions`) answers `true`. */
+  auditRequiredForWrites?: boolean;
 }
 
 export interface ConnectOptions {
@@ -36,6 +40,14 @@ export interface ConnectOptions {
   onToolsChanged?: (tools: Tool[]) => void;
   /** Called once when the runtime stops unexpectedly (worker error); calls in flight are rejected. */
   onError?: (error: Error) => void;
+  /**
+   * Approve each mutating call (write, transport or git scope); required with `config.allowWrites`. Anything
+   * but `true` refuses it before any SAP request. `signal` aborts when the call is cancelled meanwhile. Show
+   * the object, package and change, not only the tool name: the model may have been steered by code it read.
+   */
+  approveWrite?: (call: WriteCall, context: { signal: AbortSignal }) => boolean | Promise<boolean>;
+  /** Whether the host's audit store can record now; required with `options.auditRequiredForWrites`. */
+  auditReady?: () => boolean | Promise<boolean>;
   clientInfo?: { name: string; version: string };
   /** Time for the worker to load and start, in ms (default 30 000). */
   startTimeoutMs?: number;
@@ -134,9 +146,35 @@ export async function connectBrowserRuntime(worker: WorkerLike, options: Connect
   let nextId = 1;
   let stopped: Error | undefined;
 
+  // While the runtime holds a stateful ADT session (SAP locks), leaving the page must close it, or SAP keeps
+  // the locks until the session times out. A keepalive request outlives the page; stopping the worker does too.
+  const page = globalThis as {
+    addEventListener?(type: 'pagehide', listener: () => void): void;
+    removeEventListener?(type: 'pagehide', listener: () => void): void;
+  };
+  let closeSessionUrls: Array<[method: string, url: string]> = [];
+  let sessionOpen = false;
+  const closeSession = (): void => {
+    if (!sessionOpen) return;
+    sessionOpen = false;
+    page.removeEventListener?.('pagehide', closeSession);
+    for (const [method, url] of closeSessionUrls) {
+      fetch(url, {
+        method,
+        credentials: 'include',
+        keepalive: true,
+        headers: { Accept: '*/*', 'sap-adt-purpose': 'close-session', 'X-sap-adt-sessiontype': 'stateless' },
+      }).catch(() => undefined);
+    }
+  };
+  const asked = new Map<number, AbortController>();
+
   const stop = (error: Error): void => {
     if (stopped) return;
     stopped = error;
+    closeSession();
+    for (const controller of asked.values()) controller.abort();
+    asked.clear();
     for (const waiter of pending.values()) waiter.reject(error);
     pending.clear();
     worker.removeEventListener('message', onWorkerMessage);
@@ -212,10 +250,30 @@ export async function connectBrowserRuntime(worker: WorkerLike, options: Connect
   port.start();
 
   let started: { resolve: (data: { apiVersion: number; config: Record<string, unknown> }) => void } | undefined;
+  const answer = async (id: number, hook: unknown, call: WriteCall): Promise<void> => {
+    const controller = new AbortController();
+    asked.set(id, controller);
+    let value = false;
+    try {
+      if (hook === 'approveWrite') value = (await options.approveWrite?.(call, { signal: controller.signal })) === true;
+      else if (hook === 'auditReady') value = (await options.auditReady?.()) === true;
+    } catch {
+      value = false;
+    }
+    if (asked.delete(id) && !stopped) worker.postMessage({ arc1: 'answer', id, value }, []);
+  };
   const onWorkerMessage = (event: Event): void => {
     const data = (event as MessageEvent).data;
     if (data?.arc1 === 'audit') options.onAudit?.(data.event);
-    else if (data?.arc1 === 'ready') started?.resolve(data);
+    else if (data?.arc1 === 'ask') void answer(data.id, data.hook, data.call);
+    else if (data?.arc1 === 'cancel') asked.get(data.id)?.abort();
+    else if (data?.arc1 === 'session' && !data.open) {
+      sessionOpen = false;
+      page.removeEventListener?.('pagehide', closeSession);
+    } else if (data?.arc1 === 'session') {
+      sessionOpen = true;
+      page.addEventListener?.('pagehide', closeSession);
+    } else if (data?.arc1 === 'ready') started?.resolve(data);
     else if (data?.arc1 === 'error') stop(new BrowserRuntimeError(`ARC-1 runtime failed to start: ${data.message}`));
   };
   const onWorkerError = (event: Event): void => {
@@ -239,11 +297,26 @@ export async function connectBrowserRuntime(worker: WorkerLike, options: Connect
         () => stop(new BrowserRuntimeError(`ARC-1 runtime did not start within ${timeoutMs} ms.`)),
         timeoutMs,
       );
-      worker.postMessage({ arc1: 'start', options: options.options ?? {} }, [channel.port2]);
+      const pageHooks = { approveWrite: !!options.approveWrite, auditReady: !!options.auditReady };
+      worker.postMessage({ arc1: 'start', options: { ...options.options, pageHooks } }, [channel.port2]);
     });
     pending.delete('arc1:start');
     clearTimeout(timer);
     started = undefined;
+    const base = options.options?.baseUrl ?? (globalThis as { location?: { origin: string } }).location?.origin;
+    if (base) {
+      // Any stateless request to an existing ADT resource ends the context and its locks. Below 7.50 the close
+      // resource is missing, and a 404 leaves the context open (7.31 + abapfs_extensions), so discovery follows.
+      const adtUrl = (path: string): string => {
+        const url = new URL(path, base);
+        if (ready.config.client) url.searchParams.set('sap-client', String(ready.config.client));
+        return url.href;
+      };
+      closeSessionUrls = [
+        ['GET', adtUrl('/sap/bc/adt/core/http/sessions')],
+        ['HEAD', adtUrl('/sap/bc/adt/discovery')],
+      ];
+    }
 
     const init = await request('initialize', {
       protocolVersion: HOST_PROTOCOL_VERSION,
