@@ -80,9 +80,12 @@ describe('startDevServer', () => {
 
   it('serves the harness and the bundle', async () => {
     expect(await (await fetch(`${dev.url}/`)).text()).toContain('ARC-1 browser harness');
-    const worker = await fetch(`${dev.url}/harness/worker.js`);
-    expect(worker.headers.get('content-type')).toMatch(/text\/javascript/);
-    expect(await (await fetch(`${dev.url}/bundle/index.js`)).text()).toBe('export const ok = true;');
+    const page = await fetch(`${dev.url}/harness/harness.js`);
+    expect(page.headers.get('content-type')).toMatch(/text\/javascript/);
+    expect(page.headers.get('access-control-allow-origin')).toBeNull();
+    const bundle = await fetch(`${dev.url}/bundle/index.js`);
+    expect(await bundle.text()).toBe('export const ok = true;');
+    expect(bundle.headers.get('access-control-allow-origin')).toBe('*');
   });
 
   it('serves nothing outside the harness and bundle directories', async () => {
