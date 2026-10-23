@@ -240,7 +240,7 @@ test plugin rewrites the import specifiers in shared source during `transform` i
 | Files | `aff/validator.ts` (schema files; since 1.7.0 also `node:sea` assets via `readSchemaText`), `lint/config-builder.ts`, `server/deny-actions.ts` | **Done (2.6/2.7), no upstream change:** the validator's existing single-executable switch serves the schemas: a `node:sea` stand-in (`isSea()` true, `getAsset` from the 7 bundled schemas, 56 KB) plus `node:url`/`node:path` stand-ins for its module-load path. Lint config files and deny-action files are Node-only config: `node:fs`/`node:os`/`node:path` stand-ins that throw, scoped to those files. A custom abaplint config as an object is a possible later addition |
 | Cache | `cache/sqlite.ts`, `cache/sqlite-driver.ts` (`better-sqlite3` or `node:sqlite` via `node:module`, since 1.7.0) | Memory cache only |
 | Server setup | `server/server.ts` `createServer` (express, XSUAA, multi-target, plugins, stdio, `node:http`) | **Do not reuse.** New small `src/browser/` entry composing `AdtClient` + `getToolDefinitions` + `handleToolCall` |
-| Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | **Done (2.8), no upstream change:** the injected `process.stderr.write` forwards to `console.error`, so the default `StderrSink` acts as a console sink; host sinks via `logger.addSink`. `runtime-memory.ts`: not in the handler graph |
+| Logging | `server/logger.ts` (`StderrSink`), `sinks/file.ts`, `runtime-memory.ts` (`node:v8`) | **Done (2.8), no upstream change:** the injected `process.stderr.write` forwards to the console method of the line's level (`console.debug`/`info`/`warn`/`error`; unreadable lines stay on `console.error`), so the default `StderrSink` acts as a console sink; host sinks via `logger.addSink`. `runtime-memory.ts`: not in the handler graph |
 | Node globals (no import, so no redirect or esbuild error catches them) | `Buffer` (~20 shared uses: `byteLength`, base64/hex, `concat`, stored-text chunks), `process.env` (`http.ts` `ARC1_LOG_HTTP_DEBUG`, server helpers), `process.stderr` (logger, stderr sink) | **Done (2.9):** esbuild injects `src/browser/globals.ts`: `Buffer` from the `buffer` package, and a minimal `process` (empty `env`, `stderr.write` → console). The shimmed test run imports the same `Buffer` into shared source (`process` stays Node's there, since tests set env vars). `buffer` refuses `'base64url'` loudly; its only user is bearer JWT decoding, which `browserFetch` refuses |
 | Out of scope | `oauth.ts`, `abapgit.ts` (`node:net`), destinations, multi-target, plugin loader | `abapgit.ts` `isIP`: throwing bundle-only stand-in (no re-implemented SSRF check). Dependencies requiring bare `crypto` (abaplint downport rule: sha1; rate-limiter-flexible cluster limiter) get the `node:crypto` stand-in, scoped to those files |
 
@@ -326,7 +326,8 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   validator would otherwise skip validation for that type silently)
 - [x] 2.7 Lint config files / deny-action files: Node-only config, throwing stand-ins scoped to those files; the browser
   passes deny actions as an array. Also covered: stored-text decoder, `abapgit.ts` `isIP`, bare `crypto` in dependencies
-- [x] 2.8 Logger: no code change; the injected `process.stderr` routes the default sink to the console
+- [x] 2.8 Logger: no code change; the injected `process.stderr` routes the default sink to the console, by level
+  (first host test: every line on `console.error` showed INFO events as red errors)
 - [x] 2.9 Node globals: `buffer` package + minimal `process` injected (`src/browser/globals.ts`)
 - [x] Redirect table is one rule list in `scripts/browser/node-shims.mjs` (per-rule `importers` scope and
   `bundleOnly`); `browserBuildOptions()` is the shared esbuild setup for Phase 3
@@ -400,6 +401,12 @@ Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
 - [ ] Platform team wires the tool relay (outside this repo): register the tool list from the host helper with the
   backend, relay each call through `callTool`. Decided 2026-10-23: the backend relays client tools over its own
   channel instead of running an MCP client against the browser (Phase 4b)
+  - [x] Local prototype in the first host (2026-10-23, uncommitted local branches of the host's client and backend):
+    the client starts the runtime from the app designer page with the bundle served cross-origin by the dev server,
+    registers the tool list, and relays each call through `callTool` (60,000-character cap). Reads and `$TMP`
+    writes worked end to end through the host's model, backend gates and approval card, plus `approveWrite`.
+    Host-side finding: Gemini's legacy `parameters` field rejects `uniqueItems` (SAPManage), so a host must pass
+    ARC-1's schemas as `parametersJsonSchema`. The console-level fix in 2.8 came from this test
 
 ### Phase 4b: Host helper (page side)
 
