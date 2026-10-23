@@ -14,6 +14,9 @@ const OUT_OF_SCOPE_FILES = [
   'tests/unit/server/http-default-transport.test.ts', // Node HTTP server
   'tests/unit/server/shutdown.test.ts', // process signals
   'tests/unit/cli/runtime.test.ts', // CLI subprocess
+  // Cloud Connector PP transport pool (decodes the bearer JWT expiry with 'base64url')
+  'tests/unit/server/per-user-transport.test.ts',
+  'tests/unit/server/http-pp-transport.test.ts',
   // Node single-executable asset path, tested by mocking node:sea; the browser replaces that module
   // (its own tests: tests/unit/browser/node-shims-*.test.ts, http-bundle.test.ts).
   'tests/unit/aff/validator-sea.test.ts',

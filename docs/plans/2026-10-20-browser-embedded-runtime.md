@@ -280,7 +280,7 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
 - [x] `tests/unit/browser/http-bundle.test.ts` runs the bundled HTTP layer, logger, validator and a `Buffer` user in a
   vm context with only web APIs (no Node globals): requests, CSRF, console logging, embedded schemas, `Buffer` parity
 - [x] Whole handler graph (`src/handlers/dispatch.ts`) bundles for the browser: 2,018 modules, ~7.3 MB unminified
-  (mostly abaplint; Phase 3 lazy-loads it)
+  (mostly abaplint, which stays in the startup graph: see the Phase 3 note)
 - [ ] Each PR: roadmap check, size-budget check, PR template filled (live SAP testing N/A for pure refactors; state it)
 
 ### Phase 3: Browser entry + bundle
@@ -301,6 +301,12 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
     statically imported by 12 modules, including read paths (`features.ts`, method/unit surgery, compressor, deps).
     Lazy-loading means making those async upstream. The bundle loads in a worker, off the main thread; revisit with
     Phase 4 load-time measurements
+  - Re-checked 2026-10-23 at upstream 1.8.0: **not lazy-loaded, and not planned for v1.** 10 modules import
+    abaplint values statically (`features.ts`, `include-expansion.ts`, `sql-source-analyzer.ts`, `deps.ts`,
+    `contract.ts`, `method-surgery.ts`, `unit-surgery.ts`, `lint.ts`, `config-builder.ts`,
+    `abaplint-config-cache.ts`; 2 more are type-only). Upstream keeps adding sync users on read paths
+    (`include-expansion.ts`, `sql-source-analyzer.ts`), so an async split would be a large upstream change for
+    a one-time worker load (280–360 ms on localhost)
 - [x] `getEffectiveUser()`: host-supplied `user` option (decided 2026-10-22), see §4.1
 - [x] Browser config refuses or hides what v1 does not support: stored text (always-denied action), abapGit
   (`featureAbapGit` fixed off, `allowGitWrites` not configurable), SQLite cache, plugins, lint config files,
@@ -349,7 +355,7 @@ Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
 - [ ] `auditRequiredForWrites`: refuse mutations when no sink can record; reads unaffected
 - [ ] Package allowlist, deny actions and transport gates via config, same enforcement as Node
 - [ ] Live CRUD on `$TMP` in the browser harness: create, update, `edit_method`, activate, delete; plus lock conflict and tab-close cases
-- [ ] Lint-before-write on (abaplint lazy-loaded): verify bundle size and latency
+- [ ] Lint-before-write on (abaplint is already in the bundle, not lazy-loaded): verify per-write lint latency in the worker
 
 ### Phase 6: Upstream proposal
 
@@ -381,8 +387,8 @@ Results: `docs/research/2026-10-22-browser-runtime-live-read.md`.
    stateless close-session releases it immediately. Register it while a stateful window is open; a browser crash
    still leaves the lock until timeout.
 4. **Background-tab throttling** during ATC polling / long activation.
-5. **Bundle size**: 4.2 MB minified, ~1 MB gzipped (2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. Lazy-loading
-   abaplint needs upstream async changes in 12 modules (Phase 3 note). Phase 4 on localhost: worker ready in
+5. **Bundle size**: 4.2 MB minified, ~1 MB gzipped (2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. abaplint is not
+   lazy-loaded: 10 upstream modules use it synchronously, including read paths (Phase 3 note). Phase 4 on localhost: worker ready in
    280–360 ms; a real network download from the ABAP server is still to be measured in the host app.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
 7. **Upstream acceptance:** an embeddable API is a public compatibility surface (FEAT-59's concern). Mitigate with `@experimental` + `apiVersion` fuse like `arc-1/public`.
