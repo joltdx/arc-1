@@ -366,7 +366,7 @@ For every seam: no tool-definition fixture diff, existing tests green, new unit 
   (`featureAbapGit` fixed off, `allowGitWrites` not configurable), SQLite cache, plugins, lint config files,
   URL/credential/cookie/TLS/WAF-gzip settings (unknown key → error; `browserFetch` refuses them too)
 - [x] CI guard `scripts/ci/check-browser-bundle.mjs` (`npm run check:browser-bundle`, wired into `test.yml`):
-  forbidden packages, leftover imports, size budget over entry + chunks (4,350,000 bytes; fails below 90%, Playbook §5)
+  forbidden packages, leftover imports, size budget over entry + chunks (4,500,000 bytes since the 2026-10-27 upstream sync (abaplint 2.120.86); fails below 90%, Playbook §5)
 - [x] Unit tests: `tests/unit/browser/browser-server.test.ts` (`createBrowserServer` + `InMemoryTransport`:
   config validation, tool surface, read, write refusal, stored-text denial, serialization, probe, audit user,
   `SAPRead SYSTEM`); `message-port-transport.test.ts`; `browser-bundle.test.ts` runs the shipped minified bundle in a
@@ -491,7 +491,7 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
    stateless close-session releases it immediately. Register it while a stateful window is open; a browser crash
    still leaves the lock until timeout.
 4. **Background-tab throttling** during ATC polling / long activation.
-5. **Bundle size**: 4.2 MB minified, ~1 MB gzipped (2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. abaplint is not
+5. **Bundle size**: 4.38 MB minified after the 2026-10-27 sync (4.2 MB, ~1 MB gzipped on 2026-10-22); abaplint is 2.0 MB, zod 0.45 MB. abaplint is not
    lazy-loaded: 10 upstream modules use it synchronously, including read paths (Phase 3 note). Phase 4 on localhost: worker ready in
    280–360 ms; a real network download from the ABAP server is still to be measured in the host app.
 6. **Prompt injection:** code read from SAP can steer the LLM toward writes. Approval UI should show object, package and a diff, not just the tool name.
