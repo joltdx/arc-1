@@ -10,6 +10,7 @@ const OUT_OF_SCOPE_FILES = [
   'tests/unit/adt/oauth.test.ts', // browser OAuth/PKCE (base64url, not in the crypto stand-in)
   'tests/unit/server/multi-target-basic-auth.test.ts', // multi-target
   'tests/unit/server/multi-target-shared-auth-state.test.ts', // multi-target
+  'tests/unit/handlers/pinned-write-isolation.test.ts', // multi-target, overlapping tool calls on purpose
   'tests/unit/server/http-request-body.test.ts', // Node HTTP server
   'tests/unit/server/http-default-transport.test.ts', // Node HTTP server
   'tests/unit/server/shutdown.test.ts', // process signals
