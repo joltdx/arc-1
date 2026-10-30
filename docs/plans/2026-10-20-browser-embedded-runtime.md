@@ -463,7 +463,8 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
 
 ### Phase 6: Upstream proposal
 
-- [ ] Open upstream issue referencing FEAT-59 with the concrete embedding requirements (lifecycle, isolation, write safety, upgrades)
+- [x] Open upstream issue referencing FEAT-59 with the concrete embedding requirements (lifecycle, isolation, write safety, upgrades):
+  [arc-mcp/arc-1#1149](https://github.com/arc-mcp/arc-1/issues/1149) (2026-10-30)
 - [ ] ADR-0010 draft: trust model (§1.3), host-as-admin argument, safe defaults, out-of-scope list
 - [ ] Docs page `docs_page/browser-runtime.md` (embedding guide; host responsibilities)
 - [ ] Roadmap: narrow or replace FEAT-59 in overview and details
@@ -504,6 +505,9 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
    own scripts.
 9. **Open:** BTP ABAP / S/4 Cloud same-origin feasibility (not covered by v1). Audit gate shape: decided (§4.1, a
    separate `auditReady` hook).
+10. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
+   from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
+   and never send `stateless` on reads.
 11. **Plain HTTP SAP origins** have no Web Locks (secure contexts only): writes from two tabs can end each other's
    locks there. The runtime warns at start; an HTTPS origin (or the ABAP-served bundle on HTTPS) avoids it.
 12. **Parallel stateful sessions inside one tool call** share the browser's single ADT context (Node gives each its
@@ -513,9 +517,6 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
    leaves the context open there). After a normal write only the lock-free context remains until the session
    times out; after a failed UNLOCK the lock remains too. Node is affected the same way (its context is private
    to the clone, so only the lock matters there). The page's `pagehide` close covers a closed tab.
-10. **Shared ADT context across tabs:** one `sap-contextid` per browser profile; an explicit `stateless` ADT request
-   from any tab ends every lock held in it. Serialize all stateful windows (including the close) under one Web Lock,
-   and never send `stateless` on reads.
 
 ---
 
