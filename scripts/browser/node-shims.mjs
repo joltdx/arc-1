@@ -35,6 +35,8 @@ export const SHIM_RULES = [
   { specifier: 'node:sea', shim: shim('sea.ts'), importers: [VALIDATOR] },
   { specifier: 'node:url', shim: shim('url.ts'), importers: [VALIDATOR] },
   { specifier: 'node:path', shim: shim('path.ts'), importers: [VALIDATOR] },
+  // The browser's own TextDecoder, for source plug-in discovery (SAPRead).
+  { specifier: 'node:util', shim: shim('util.ts'), importers: ['src/adt/source-plugin-parser.ts'] },
   // Unreachable with the browser config.
   { specifier: 'undici', shim: shim('undici.ts'), bundleOnly: true },
   {
