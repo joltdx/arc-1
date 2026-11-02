@@ -167,10 +167,12 @@ async function openPage(withLogon: boolean) {
   return { context, page, requests };
 }
 
+// The [extensions] footer reports wall-clock time, which is never the same in two runs.
 function text(result: unknown): string {
   return ((result as { content: unknown }).content as Array<{ type: string; text: string }>)
     .map((part) => part.text)
-    .join('\n');
+    .join('\n')
+    .replace(/"elapsedMs":\d+/g, '"elapsedMs":0');
 }
 
 const nodeConfig = resolveBrowserConfig({ client: SAP_CLIENT }, SAP_USER);
@@ -359,7 +361,9 @@ describe('host helper with the bundle on another origin (read-only)', () => {
       ([name, a]) => (globalThis as unknown as HarnessPage).arc1Harness.hostCall(name, a),
       ['SAPRead', args] as const,
     );
-    expect(text(result)).toBe(text(await handleToolCall(nodeClient, nodeConfig, 'SAPRead', { ...args })));
+    // A fresh Node client, like the fresh runtime: extension discovery's footer counts requests a warm client skips.
+    const coldNodeClient = getTestClient();
+    expect(text(result)).toBe(text(await handleToolCall(coldNodeClient, nodeConfig, 'SAPRead', { ...args })));
   });
 
   it('cuts the result text on request', async () => {
