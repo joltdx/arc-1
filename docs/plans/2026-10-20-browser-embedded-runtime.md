@@ -459,7 +459,8 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
 - [x] Lint-before-write on (abaplint is already in the bundle, not lazy-loaded): verify per-write lint latency in the worker — 9–22 ms per lint of a small class (7.57)
 - [x] Live writes on system A (7.31, `abapfs_extensions`): 21/21 after the `pagehide` fix above
   - Re-run after the 2026-11-02 upstream sync: 21/21 once the parity checks allowed for the new `[extensions]`
-    footer (`elapsedMs` differs every run; a warm client makes fewer discovery requests than a fresh one)
+    footer (`elapsedMs` differs every run; a warm client makes fewer discovery requests than a fresh one);
+    system B (7.57) 21/21 too
 - [ ] Decide: ARC-1's own close (`http.ts` `closeStatefulSession`) leaves the context open on 7.31 + `abapfs_extensions`
   (Node and browser). Harmless while UNLOCK succeeds; if UNLOCK fails, the lock stays until the session times out.
   Candidate upstream fix: a final `/sap/bc/adt/discovery` fallback (see §6 risk 13)
