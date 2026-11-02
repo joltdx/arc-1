@@ -430,6 +430,7 @@ describe('browser runtime host helper: writes', () => {
   let runtime: BrowserRuntime | undefined;
   let page: EventTarget;
   let pageFetch: ReturnType<typeof vi.fn<typeof fetch>>;
+  let addPageListener: ReturnType<typeof vi.fn<EventTarget['addEventListener']>>;
 
   /** SAP for one $TMP program; the PUT waits for `putGate` when given. */
   function writableSap(putGate?: Promise<void>) {
@@ -470,7 +471,8 @@ describe('browser runtime host helper: writes', () => {
     resetCachedFeatures();
     page = new EventTarget();
     pageFetch = vi.fn<typeof fetch>(async () => mockResponse(200, ''));
-    vi.stubGlobal('addEventListener', page.addEventListener.bind(page));
+    addPageListener = vi.fn(page.addEventListener.bind(page));
+    vi.stubGlobal('addEventListener', addPageListener);
     vi.stubGlobal('removeEventListener', page.removeEventListener.bind(page));
     vi.stubGlobal('fetch', pageFetch);
   });
@@ -596,6 +598,8 @@ describe('browser runtime host helper: writes', () => {
 
     const call = runtime.callTool('SAPWrite', UPDATE);
     await vi.waitFor(() => expect(sap.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true));
+    // The worker's session message may reach the page after the PUT starts; stop once the page has it.
+    await vi.waitFor(() => expect(addPageListener).toHaveBeenCalledWith('pagehide', expect.any(Function)));
     runtime.close();
 
     await expect(call).rejects.toThrow(/closed/);
