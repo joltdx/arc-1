@@ -31,6 +31,7 @@ const OUT_OF_SCOPE_TESTS = [
   'shares a FIFO process-wide lease, leaves source reads independent, and holds it through terminal audit',
   'classifies an expired admission wait and releases the two active slots',
   'admits at most two full analyses across independent clients',
+  'keeps concurrent callers and their cookies isolated on the same SAP endpoint',
   // Bearer JWT decoding ('base64url', unknown to the buffer package): browserFetch refuses bearer auth.
   'getEffectiveUser derives the user from the bearer JWT user_name when no SAP_USER',
   'getEffectiveUser retries after a transient token-provider failure',
