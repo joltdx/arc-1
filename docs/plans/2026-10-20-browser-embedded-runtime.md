@@ -461,6 +461,9 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
   - Re-run after the 2026-11-02 upstream sync: 21/21 once the parity checks allowed for the new `[extensions]`
     footer (`elapsedMs` differs every run; a warm client makes fewer discovery requests than a fresh one);
     system B (7.57) 21/21 too
+  - Re-run after the 2026-11-04 upstream sync (1.10.0, no conflicts): system A 21/21. One earlier run failed
+    parity because the Node reference hit the `[extensions]` read deadline on a slow response; two reruns passed.
+    System B (7.57) 21/21
 - [ ] Decide: ARC-1's own close (`http.ts` `closeStatefulSession`) leaves the context open on 7.31 + `abapfs_extensions`
   (Node and browser). Harmless while UNLOCK succeeds; if UNLOCK fails, the lock stays until the session times out.
   Candidate upstream fix: a final `/sap/bc/adt/discovery` fallback (see §6 risk 13)
