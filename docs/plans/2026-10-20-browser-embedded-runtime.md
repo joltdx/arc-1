@@ -466,6 +466,8 @@ writes block of `host.test.ts`, `http-browser.test.ts` (`statefulWindow`). Live 
     System B (7.57) 21/21
   - Re-run after the 2026-11-09 upstream sync (1.10.1, no conflicts, no snapshot or budget changes): system A 21/21,
     system B (7.57) 21/21
+  - Re-run after the 2026-11-10 upstream sync (dependency and CI bumps only; `package.json` devDependency conflict
+    resolved by hand, lockfile regenerated): system A 21/21, system B (7.57) 21/21
 - [ ] Decide: ARC-1's own close (`http.ts` `closeStatefulSession`) leaves the context open on 7.31 + `abapfs_extensions`
   (Node and browser). Harmless while UNLOCK succeeds; if UNLOCK fails, the lock stays until the session times out.
   Candidate upstream fix: a final `/sap/bc/adt/discovery` fallback (see §6 risk 13)
